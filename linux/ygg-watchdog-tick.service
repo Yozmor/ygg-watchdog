@@ -1,0 +1,15 @@
+[Unit]
+Description=Yggdrasil watchdog - один цикл проверки
+After=yggdrasil.service
+Wants=yggdrasil.service
+
+[Service]
+Type=oneshot
+# Путь подставляет install.sh. Если ставишь вручную - поправь под свою папку
+WorkingDirectory=/opt/ygg-watchdog
+ExecStart=/usr/bin/python3 /opt/ygg-watchdog/watchdog_daemon.py tick
+User=root
+
+# Логи цикла идут в journal, смотри через: journalctl -u ygg-watchdog-tick
+StandardOutput=journal
+StandardError=journal

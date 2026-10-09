@@ -1,0 +1,15 @@
+[Unit]
+Description=Yggdrasil watchdog - таймер регулярной проверки
+
+[Timer]
+# Первая проверка - через минуту после старта системы, дальше -
+# каждые 3 минуты. Поправь OnUnitActiveSec, если хочешь чаще/реже -
+# слишком часто (каждые 10-30 сек) не нужно, у addPeer/getPeers есть
+# своя задержка на handshake, слишком редко (раз в 30+ минут) - долго
+# будешь ждать уведомления о падении пиров.
+OnBootSec=1min
+OnUnitActiveSec=3min
+Unit=ygg-watchdog-tick.service
+
+[Install]
+WantedBy=timers.target
