@@ -7,7 +7,7 @@
 ## Быстрый старт
 
 - **Windows:** скачай из папки [`windows`](windows) три файла — `ygg_watchdog.exe`, `cities.dat`, `notify.conf.example` — положи их в одну папку, дважды кликни `ygg_watchdog.exe` и в меню нажми **2**.
-- **Linux:** `git clone https://github.com/Yozmor/ygg-watchdog.git && cd ygg-watchdog/linux && sudo ./install.sh`
+- **Linux:** выполни 6 команд из раздела [Установка → Linux](#linux), программа встанет в `~/ygg-watchdog`.
 
 ## Что делает
 
@@ -48,20 +48,43 @@
 
 ### Linux
 
-Нужны Python 3, systemd и установленный Yggdrasil.
+Нужны Python 3, systemd, git и установленный Yggdrasil.
+
+**Установка** — скопируй и выполни целиком:
 
 ```bash
-git clone https://github.com/Yozmor/ygg-watchdog.git
-cd ygg-watchdog/linux
+git clone https://github.com/Yozmor/ygg-watchdog.git /tmp/ygg-src
+mkdir -p ~/ygg-watchdog
+cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
+rm -rf /tmp/ygg-src
+cd ~/ygg-watchdog
 sudo ./install.sh
 ```
 
-Установщик скопирует программу в `/opt/ygg-watchdog`, включит systemd-таймер (проверка каждые 3 минуты) и добавит команду `ygg-watchdog` для меню. Повторный запуск обновляет программу, настройки и логи сохраняются. Удалить: `sudo ./install.sh --remove`.
+Что происходит по шагам:
+1. репозиторий скачивается во временную папку `/tmp/ygg-src`;
+2. создаётся папка программы `~/ygg-watchdog`;
+3. туда копируются файлы из папки `linux` (именно файлы, без лишней вложенной папки);
+4. временная папка удаляется;
+5. `install.sh` включает автопроверку каждые 3 минуты и добавляет команду `ygg-watchdog` для меню.
+
+Программа живёт и работает в `~/ygg-watchdog`. Не клонируй репозиторий прямо в `~/ygg-watchdog`: там должна лежать сама программа, а не весь репозиторий.
+
+**Обновление** — те же команды. Новые файлы заменят старые, а твои `notify.conf`, `state.json` и логи останутся: в репозитории их нет, поэтому они не перезаписываются.
+
+**Проверка и работа:**
 
 ```bash
-ygg-watchdog                                  # меню
-sudo python3 /opt/ygg-watchdog/selftest.py    # самопроверка
-tail -f /opt/ygg-watchdog/watchdog.log        # лог
+ygg-watchdog                                    # меню
+sudo python3 -B ~/ygg-watchdog/selftest.py      # самопроверка, все пункты должны быть OK
+tail -f ~/ygg-watchdog/watchdog.log             # лог
+```
+
+**Удаление:**
+
+```bash
+cd ~/ygg-watchdog && sudo ./install.sh --remove   # выключить автопроверку
+sudo rm -rf ~/ygg-watchdog                        # удалить файлы
 ```
 
 Подробно: [linux/README_LINUX.md](linux/README_LINUX.md)
@@ -85,7 +108,7 @@ CHAT_ID=987654321
 ## Команды без меню (Linux)
 
 ```bash
-cd /opt/ygg-watchdog
+cd ~/ygg-watchdog
 sudo python3 watchdog_daemon.py tick                          # одна проверка
 sudo python3 watchdog_daemon.py status                        # статус
 sudo python3 watchdog_daemon.py list-countries                # список стран
