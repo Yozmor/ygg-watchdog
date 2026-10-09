@@ -35,17 +35,17 @@ echo.
 where g++ >nul 2>&1
 if not errorlevel 1 (
     echo Найден g++, собираю через MinGW...
+    pushd "%SCRIPT_DIR%"
     set "RESOBJ="
     where windres >nul 2>&1
-    if not errorlevel 1 if exist "%SCRIPT_DIR%app.rc" (
-        pushd "%SCRIPT_DIR%"
+    if not errorlevel 1 if exist app.rc (
         windres app.rc -O coff -o app.res
-        if not errorlevel 1 set "RESOBJ=%SCRIPT_DIR%app.res"
-        popd
+        if not errorlevel 1 set "RESOBJ=app.res"
     )
-    g++ -std=c++17 -O2 -municode -static -o "%EXE%" "%SRC%" !RESOBJ! -lwinhttp -lshell32 -ladvapi32
+    g++ -std=c++17 -O2 -municode -static -o ygg_watchdog.exe ygg_watchdog.cpp !RESOBJ! -lwinhttp -lws2_32 -lshell32 -ladvapi32
     set "GPPRESULT=!errorlevel!"
-    if exist "%SCRIPT_DIR%app.res" del "%SCRIPT_DIR%app.res"
+    if exist app.res del app.res
+    popd
     if "!GPPRESULT!"=="0" goto BUILD_OK
     echo.
     echo Ошибка сборки через g++. Смотри текст ошибки выше.
@@ -59,7 +59,7 @@ if not errorlevel 1 (
     pushd "%SCRIPT_DIR%"
     set "RESOBJ="
     if exist app.rc rc /nologo /fo app.res app.rc >nul && set "RESOBJ=app.res"
-    cl /nologo /EHsc /std:c++17 /utf-8 "%SRC%" !RESOBJ! /Fe:"%EXE%" /link Winhttp.lib
+    cl /nologo /EHsc /std:c++17 /utf-8 "%SRC%" !RESOBJ! /Fe:"%EXE%" /link Winhttp.lib Ws2_32.lib Shell32.lib Advapi32.lib
     set "CLRESULT=!errorlevel!"
     if exist app.res del app.res
     if exist ygg_watchdog.obj del ygg_watchdog.obj
@@ -98,7 +98,9 @@ if errorlevel 1 goto NOCOMPILER
 
 echo Собираю через автоматически найденный MSVC...
 pushd "%SCRIPT_DIR%"
-cl /nologo /EHsc /std:c++17 /utf-8 "%SRC%" /Fe:"%EXE%" /link Winhttp.lib
+set "RESOBJ="
+if exist app.rc rc /nologo /fo app.res app.rc >nul && set "RESOBJ=app.res"
+cl /nologo /EHsc /std:c++17 /utf-8 "%SRC%" !RESOBJ! /Fe:"%EXE%" /link Winhttp.lib Ws2_32.lib Shell32.lib Advapi32.lib
 set "CLRESULT=!errorlevel!"
 if exist app.res del app.res
 if exist ygg_watchdog.obj del ygg_watchdog.obj

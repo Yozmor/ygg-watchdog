@@ -42,6 +42,7 @@
 #include <codecvt>
 #include <algorithm>
 #include <functional>
+#include <cstdlib>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -115,7 +116,7 @@ void Log(const std::wstring& level, const std::wstring& message) {
     int size = WideCharToMultiByte(CP_UTF8, 0, withNewline.c_str(), -1, nullptr, 0, nullptr, nullptr);
     std::string utf8(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, withNewline.c_str(), -1, &utf8[0], size, nullptr, nullptr);
-    std::ofstream rawFile(LogPath(), std::ios::app | std::ios::binary);
+    std::ofstream rawFile(LogPath().c_str(), std::ios::app | std::ios::binary);
     if (rawFile.is_open()) {
         rawFile.write(utf8.c_str(), utf8.size() - 1); // без завершающего \0
     }
@@ -138,7 +139,7 @@ std::optional<std::wstring> FindConfigPath() {
 }
 
 std::wstring ReadFileUtf8(const std::wstring& path) {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path.c_str(), std::ios::binary);
     if (!file.is_open()) return L"";
     std::stringstream buffer;
     buffer << file.rdbuf();
@@ -209,7 +210,7 @@ bool ModifyMainPeers(const std::wstring& configPath, std::function<void(std::vec
     int size = WideCharToMultiByte(CP_UTF8, 0, newText.c_str(), (int)newText.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, newText.c_str(), (int)newText.size(), &utf8[0], size, nullptr, nullptr);
-    std::ofstream out(configPath, std::ios::trunc | std::ios::binary);
+    std::ofstream out(configPath.c_str(), std::ios::trunc | std::ios::binary);
     if (!out.is_open()) {
         LogError(L"Не удалось открыть конфиг для записи (нет прав?): " + configPath);
         return false;
@@ -900,7 +901,7 @@ struct City {
 std::vector<City> LoadCityDatabase() {
     std::vector<City> cities;
     std::wstring path = GetExeDir() + L"cities.dat";
-    std::wifstream file(path);
+    std::wifstream file(path.c_str());
     if (!file.is_open()) {
         LogError(L"Не найден cities.dat рядом с exe - региональный режим не сможет искать по координатам");
         return cities;
@@ -1058,7 +1059,7 @@ void SaveState(const WatchdogState& state) {
     std::string utf8(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[0], size, nullptr, nullptr);
 
-    std::ofstream f(StatePath(), std::ios::binary | std::ios::trunc);
+    std::ofstream f(StatePath().c_str(), std::ios::binary | std::ios::trunc);
     f.write(utf8.c_str(), utf8.size());
 }
 
@@ -1362,7 +1363,7 @@ void CleanOldLogEntries() {
     int size = WideCharToMultiByte(CP_UTF8, 0, newContent.c_str(), (int)newContent.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, newContent.c_str(), (int)newContent.size(), &utf8[0], size, nullptr, nullptr);
-    std::ofstream out(path, std::ios::trunc | std::ios::binary);
+    std::ofstream out(path.c_str(), std::ios::trunc | std::ios::binary);
     if (out.is_open()) {
         out.write(utf8.c_str(), utf8.size());
     }
@@ -1728,28 +1729,7 @@ void RelaunchElevated(int argc, wchar_t* argv[]) {
     }
 }
 
-int wmain(int argc, wchar_t* argv[]) {
-    std::vector<std::wstring> args;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring a = argv[i];
-        if (a == L"-v" || a == L"--verbose") {
-            g_verboseMode = true;
-        } else {
-            args.push_back(a);
-        }
-    }
-
-    if (args.empty()) {
-        LogInfo(L"Использование: ygg_watchdog.exe [-v] [tick|install-task|add-region <страна> <город>|remove-region]");
-        return 1;
-    }
-
-    if (!IsElevated()) {
-        LogInfo(L"Требуются права администратора, перезапуск с повышением прав...");
-        RelaunchElevated(argc, argv); // передаём оригинальные argv, включая -v, если был
-        return 0;
-    }
-
+int RunCommand(const std::vector<std::wstring>& args) {
     std::wstring command = args[0];
 
     if (command == L"tick") {
@@ -1806,4 +1786,110 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     return 0;
+}
+
+// ------------------------------------------------------------------
+// Интерактивное меню: открывается при запуске exe без аргументов
+// (например, двойным кликом). Повторяет меню из run_ygg_watchdog.bat.
+// ------------------------------------------------------------------
+static void Print(const std::wstring& s) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD w = 0;
+    WriteConsoleW(h, s.c_str(), (DWORD)s.size(), &w, nullptr);
+}
+
+static std::wstring ReadLine(const std::wstring& prompt) {
+    Print(prompt);
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    wchar_t buf[1024];
+    DWORD n = 0;
+    if (!ReadConsoleW(h, buf, 1023, &n, nullptr)) return L"";
+    std::wstring s(buf, n);
+    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ')) s.pop_back();
+    while (!s.empty() && s.front() == L' ') s.erase(s.begin());
+    return s;
+}
+
+static void RunMenu() {
+    for (;;) {
+        system("cls");
+        Print(L"================================================\n"
+              L"        YGG WATCHDOG\n"
+              L"================================================\n\n"
+              L"  1 - Проверить сейчас (tick)\n"
+              L"  2 - Установить задачу планировщика (install-task)\n"
+              L"  3 - Добавить регион (страна + город)\n"
+              L"  4 - Убрать региональный режим\n"
+              L"  5 - Показать основные пиры\n"
+              L"  6 - Добавить основной пир\n"
+              L"  7 - Удалить основной пир\n"
+              L"  8 - Перезапустить Yggdrasil СЕЙЧАС (обрывает сессии по Yggdrasil!)\n"
+              L"  9 - Перезапустить Yggdrasil С ЗАДЕРЖКОЙ (безопасно при RDP по Yggdrasil)\n"
+              L"  0 - Выход\n\n");
+        std::wstring c = ReadLine(L"Выбор: ");
+        Print(L"\n");
+        if (c == L"1") {
+            RunCommand({L"tick"});
+        } else if (c == L"2") {
+            RunCommand({L"install-task"});
+        } else if (c == L"3") {
+            RunCommand({L"list-countries"});
+            std::wstring country = ReadLine(L"\nНомер страны из списка выше: ");
+            if (!country.empty()) {
+                Print(L"\n");
+                RunCommand({L"list-cities", country});
+                std::wstring city = ReadLine(L"\nНомер города из списка выше (например 1): ");
+                if (!city.empty()) RunCommand({L"add-region", country, city});
+            }
+        } else if (c == L"4") {
+            RunCommand({L"remove-region"});
+        } else if (c == L"5") {
+            RunCommand({L"list-main-peers"});
+        } else if (c == L"6") {
+            std::wstring uri = ReadLine(L"URI пира (например tls://host:port): ");
+            if (!uri.empty()) {
+                RunCommand({L"add-main-peer", uri});
+                Print(L"\nНе забудь перезапустить службу - изменения вступят в силу только после этого.\n");
+            }
+        } else if (c == L"7") {
+            RunCommand({L"list-main-peers"});
+            std::wstring num = ReadLine(L"\nНомер пира для удаления: ");
+            if (!num.empty()) {
+                RunCommand({L"remove-main-peer", num});
+                Print(L"\nНе забудь перезапустить службу - изменения вступят в силу только после этого.\n");
+            }
+        } else if (c == L"8") {
+            RunCommand({L"restart-yggdrasil"});
+        } else if (c == L"9") {
+            std::wstring d = ReadLine(L"Задержка в секундах (по умолчанию 10): ");
+            RunCommand({L"restart-yggdrasil-delayed", d.empty() ? std::wstring(L"10") : d});
+        } else {
+            return;
+        }
+        ReadLine(L"\nНажми Enter, чтобы вернуться в меню...");
+    }
+}
+
+int wmain(int argc, wchar_t* argv[]) {
+    std::vector<std::wstring> args;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"-v" || a == L"--verbose") {
+            g_verboseMode = true;
+        } else {
+            args.push_back(a);
+        }
+    }
+
+    if (!IsElevated()) {
+        LogInfo(L"Требуются права администратора, перезапуск с повышением прав...");
+        RelaunchElevated(argc, argv); // передаём оригинальные argv, включая -v, если был
+        return 0;
+    }
+
+    if (args.empty()) {   // двойной клик: открываем меню
+        RunMenu();
+        return 0;
+    }
+    return RunCommand(args);
 }
