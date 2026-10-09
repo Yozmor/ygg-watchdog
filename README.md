@@ -4,6 +4,13 @@
 
 Сторож для [Yggdrasil](https://yggdrasil-network.github.io/): следит за пирами и сам чинит связь, когда они отваливаются. Есть версии для Linux (Python + systemd) и Windows (C++ + Планировщик заданий).
 
+## Быстрый старт
+
+| Система | Что сделать |
+|---|---|
+| Windows | Скачать `ygg-watchdog-windows.zip` из [Releases](https://github.com/Yozmor/ygg-watchdog/releases) → распаковать → двойной клик по `ygg_watchdog.exe` → в меню нажать **2** |
+| Linux | `git clone https://github.com/Yozmor/ygg-watchdog.git && cd ygg-watchdog/linux && sudo ./install.sh` |
+
 ## Что делает
 
 Каждые 3 минуты программа проверяет пиры Yggdrasil и действует сама:
@@ -21,11 +28,23 @@
 
 ### Windows
 
-1. Скачай `ygg-watchdog-windows.zip` из [Releases](https://github.com/Yozmor/ygg-watchdog/releases): там уже собранный `ygg_watchdog.exe`, компилятор не нужен.
-2. Распакуй в постоянную папку, например `C:\Tools\ygg-watchdog`.
-3. Запусти `run_ygg_watchdog.bat` и в меню выбери **2**: установится задача Планировщика, которая будет проверять пиры каждые 3 минуты от имени SYSTEM, даже когда никто не вошёл в систему.
+**Вариант 1. Готовая программа (проще всего)**
 
-Подробно: [windows/README_WINDOWS.md](windows/README_WINDOWS.md)
+1. Открой раздел [**Releases**](https://github.com/Yozmor/ygg-watchdog/releases) справа на странице репозитория.
+2. В последнем релизе скачай файл **`ygg-watchdog-windows.zip`**.
+3. Распакуй его в постоянную папку, например `C:\Tools\ygg-watchdog`. Не запускай прямо из архива и не держи в «Загрузках»: планировщик запомнит путь.
+4. Дважды кликни **`ygg_watchdog.exe`**. Windows спросит права администратора, соглашайся. Откроется меню.
+5. В меню нажми **2** и Enter: установится задача Планировщика. Готово, теперь сторож сам проверяет пиры каждые 3 минуты, даже когда ты не вошёл в систему.
+
+**Вариант 2. Собрать из исходника** (если релиза нет или ты поменял код)
+
+1. Зелёная кнопка **Code → Download ZIP**, распакуй.
+2. Открой папку **`windows`** и запусти **`run_ygg_watchdog.bat`**. Он сам соберёт `ygg_watchdog.exe` с иконкой и откроет меню.
+3. Для сборки нужен компилятор: [MinGW-w64](https://winlibs.com/) (распаковать и добавить папку `bin` в PATH) или Visual Studio с компонентом «Разработка классических приложений на C++».
+
+> Файлы `cities.dat` и `notify.conf.example` должны лежать в одной папке с exe.
+
+Подробно про меню и настройки: [windows/README_WINDOWS.md](windows/README_WINDOWS.md)
 
 ### Linux
 
