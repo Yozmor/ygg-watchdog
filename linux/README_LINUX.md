@@ -155,6 +155,11 @@ ygg-watchdog
 сработало (нет сети наружу, сервисы недоступны). Пустой ввод снимает
 домашний регион.
 
+Как и в региональном режиме, выбирается страна, а затем город из базы
+(Enter - любой город страны). Если город задан и резервные ищутся в
+этой же стране, первыми проверяются пиры, ближайшие к нему по
+координатам.
+
 ### Пункты 13-15 - Устройства для мониторинга
 Добровольно добавленные ноутбуки (НЕ телефон - решили специально не
 подключать), проверяются только после подтверждённой основной
@@ -295,7 +300,7 @@ sudo python3 watchdog_daemon.py list-countries                # список с�
 sudo python3 watchdog_daemon.py list-cities russia            # города страны (номер или slug)
 sudo python3 watchdog_daemon.py add-region russia Vladivostok # регион напрямую (без меню)
 sudo python3 watchdog_daemon.py remove-region
-sudo python3 watchdog_daemon.py set-home-region russia        # домашний регион ("clear" или без аргумента - снять)
+sudo python3 watchdog_daemon.py set-home-region russia Moscow # домашний регион, город необязателен ("clear" или без аргумента - снять)
 sudo python3 watchdog_daemon.py list-main-peers
 sudo python3 watchdog_daemon.py add-main-peer tls://host:port
 sudo python3 watchdog_daemon.py remove-main-peer 2

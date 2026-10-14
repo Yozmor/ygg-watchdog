@@ -320,10 +320,53 @@ def cmd_remove_region(args: argparse.Namespace) -> int:
 
 def cmd_set_home_region(args: argparse.Namespace) -> int:
     """Домашний регион - запасной вариант для поиска резервных пиров,
-    когда egress-регион (GeoIP) определить не удалось. 'clear' снимает."""
+    когда egress-регион (GeoIP) определить не удалось. Страна + (необязательно)
+    город, как в региональном режиме. 'clear' или пусто - снять.
+    Из меню (interactive=True) спрашивает страну и город по спискам."""
+    if getattr(args, "interactive", False):
+        print("Загружаю список стран из GitHub...")
+        try:
+            entries = pd.get_sorted_country_list()
+        except Exception as e:
+            print(f"Не удалось получить список: {e}", file=sys.stderr)
+            return 1
+        for i, e in enumerate(entries, 1):
+            suffix = "" if e.supported else " (координаты пока не поддерживаются)"
+            print(f"  {i}) {e.ru_name}{suffix}")
+        country_input = input("Номер страны (пусто - снять домашний регион): ").strip()
+        city_input = ""
+        if country_input:
+            slug = _resolve_country_input(country_input)
+            iso = pd.slug_to_iso(slug) if slug else None
+            if iso is None:
+                print("Неверный номер страны.", file=sys.stderr)
+                return 1
+            cities = pd.get_cities_for_country(pd.load_city_database(), iso)
+            print(f"\nГорода для '{slug}' ({iso}), всего {len(cities)}:")
+            for i, c in enumerate(cities, 1):
+                print(f"  {i}) {c.display_label()} (население: {c.population})")
+            print("\nЕсли подходит ЛЮБОЙ город страны - просто нажми Enter, ничего не вводя.")
+            city_input = input("Номер города (необязательно): ").strip()
+            country_input = slug
+        args = argparse.Namespace(country=country_input or None, city=city_input or None)
+
     state = wc.load_state()
-    country = None if (not args.country or args.country.lower() == "clear") else args.country
-    events = wc.cmd_set_home_region(state, country)
+    if not args.country or args.country.lower() == "clear":
+        events = wc.cmd_set_home_region(state, None)
+    else:
+        slug = _resolve_country_input(args.country)
+        iso = pd.slug_to_iso(slug) if slug else None
+        if iso is None:
+            print(f"Неизвестная страна: '{args.country}'. Список стран - команда list-countries.", file=sys.stderr)
+            return 1
+        city_name = None
+        if getattr(args, "city", None):
+            city_obj = _resolve_city_input(args.city, iso)
+            if city_obj is None:
+                print(f"Не удалось определить город по вводу '{args.city}' (list-cities {slug}).", file=sys.stderr)
+                return 1
+            city_name = city_obj.name
+        events = wc.cmd_set_home_region(state, slug, city_name)
     wc.save_state(state)
     append_events(events)
 
@@ -580,7 +623,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print(f"Конфиг: {config_path if config_path else '(не найден)'}")
     print(f"Режим: {state.mode}")
-    print(f"Домашний регион: {state.home_region or '(не задан)'}")
+    home = state.home_region or '(не задан)'
+    if state.home_region and state.home_city:
+        home += f"/{state.home_city}"
+    print(f"Домашний регион: {home}")
     print(f"Egress-регион (кэш): {state.egress_region or '(не определён)'}")
 
     if config_path:
@@ -665,7 +711,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print("  9 - Перезапустить Yggdrasil С ЗАДЕРЖКОЙ (безопасно при SSH по Yggdrasil)")
         print("  10 - Остановить автоматические проверки (systemd-таймер)")
         print("  11 - Включить автоматические проверки обратно")
-        print("  12 - Задать домашний регион (запасной вариант для резервных пиров)")
+        print("  12 - Задать домашний регион (страна + город, запасной вариант для резервных пиров)")
         print("  13 - Показать мониторимые устройства")
         print("  14 - Добавить устройство в мониторинг")
         print("  15 - Убрать устройство из мониторинга")
@@ -708,8 +754,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         elif choice == "11":
             cmd_start_timer(argparse.Namespace())
         elif choice == "12":
-            country = input("Slug страны (list-countries), или пусто чтобы снять: ").strip()
-            cmd_set_home_region(argparse.Namespace(country=country or None))
+            cmd_set_home_region(argparse.Namespace(interactive=True))
         elif choice == "13":
             cmd_list_devices(argparse.Namespace())
         elif choice == "14":
@@ -783,7 +828,9 @@ def main() -> int:
         "set-home-region",
         help="Задать домашний регион - запасной вариант, если egress-регион (GeoIP) не определился",
     )
-    p_home.add_argument("country", nargs="?", help="Slug страны (list-countries) или 'clear', чтобы снять")
+    p_home.add_argument("country", nargs="?", help="Страна: номер (list-countries) или slug; 'clear' - снять")
+    p_home.add_argument("city", nargs="?", default=None,
+                        help="Город: номер (list-cities) или точное название - необязательно")
     p_home.set_defaults(func=cmd_set_home_region)
 
     p_dev_add = subparsers.add_parser("add-device", help="Добавить устройство в мониторинг (Level 2)")

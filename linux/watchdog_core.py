@@ -249,6 +249,7 @@ class WatchdogState:
     internet_down_since: Optional[float] = None  # unix timestamp, локальные часы (не зависят от интернета)
     consecutive_region_fetch_failures: int = 0  # подряд неудач обращения к GitHub, хотя интернет вроде жив
     home_region: Optional[str] = None  # slug репозитория, задаётся руками (set-home-region), всегда запасной вариант
+    home_city: Optional[str] = None  # ascii-имя города из cities.dat внутри home_region (None = любой город страны)
     egress_region: Optional[str] = None  # slug - где СЕЙЧАС реально выходит трафик (кэш, см. get_backup_search_region)
     egress_region_checked_at: Optional[float] = None  # когда egress_region последний раз пересчитывался (успешно или нет)
     # Крайний перебор (крайняя мера): снимок списка стран на текущий проход + курсор
@@ -278,6 +279,7 @@ class WatchdogState:
             "internet_down_since": self.internet_down_since,
             "consecutive_region_fetch_failures": self.consecutive_region_fetch_failures,
             "home_region": self.home_region,
+            "home_city": self.home_city,
             "egress_region": self.egress_region,
             "egress_region_checked_at": self.egress_region_checked_at,
             "crisis_country_slugs": self.crisis_country_slugs,
@@ -304,6 +306,7 @@ class WatchdogState:
             internet_down_since=d.get("internet_down_since"),
             consecutive_region_fetch_failures=d.get("consecutive_region_fetch_failures", 0),
             home_region=d.get("home_region"),
+            home_city=d.get("home_city"),
             egress_region=d.get("egress_region"),
             egress_region_checked_at=d.get("egress_region_checked_at"),
             crisis_country_slugs=list(d.get("crisis_country_slugs", [])),
@@ -913,7 +916,10 @@ def tick(config_path: Path, state: WatchdogState) -> list[Event]:
     state.consecutive_region_fetch_failures = 0
 
     exclude = {h for uri in (main_peers + state.backup_peers) if (h := _host_from_uri(uri))}
-    candidates = pd.pick_replacement_peers(region, exclude_hosts=exclude, count=1)
+    # Если ищем в стране домашнего региона и в нём задан город - берём
+    # ближайших к этому городу пиров первыми (как в региональном режиме).
+    home_city = state.home_city if (state.home_region and region == state.home_region) else None
+    candidates = _find_region_candidates(region, home_city, exclude, count=1)
 
     if candidates:
         peer = candidates[0]
@@ -1028,7 +1034,8 @@ def cmd_remove_region(state: WatchdogState) -> list[Event]:
     return events
 
 
-def cmd_set_home_region(state: WatchdogState, country_slug: Optional[str]) -> list[Event]:
+def cmd_set_home_region(state: WatchdogState, country_slug: Optional[str],
+                        city_name: Optional[str] = None) -> list[Event]:
     """Задаёт домашний регион (slug из репозитория public-peers, например
     'russia') - запасной вариант для поиска резервных пиров, когда
     egress-регион через GeoIP определить не удалось (все провайдеры
@@ -1037,7 +1044,10 @@ def cmd_set_home_region(state: WatchdogState, country_slug: Optional[str]) -> li
     настроек в этом модуле)."""
     if country_slug is None:
         old = state.home_region
+        if old and state.home_city:
+            old = f"{old}/{state.home_city}"
         state.home_region = None
+        state.home_city = None
         return [Event("home_region_cleared", f"Домашний регион снят (был: {old or '(не задан)'})")]
 
     slug = country_slug.strip().lower()
@@ -1049,7 +1059,13 @@ def cmd_set_home_region(state: WatchdogState, country_slug: Optional[str]) -> li
         )]
 
     state.home_region = slug
-    return [Event("home_region_set", f"Домашний регион установлен: {slug}")]
+    state.home_city = city_name or None
+    # Сбрасываем запомненный регион резервных, если резервных сейчас нет -
+    # чтобы следующий поиск шёл уже по новому домашнему региону.
+    if not state.backup_peers:
+        state.backup_region = None
+    shown = f"{slug}/{city_name}" if city_name else f"{slug} (любой город)"
+    return [Event("home_region_set", f"Домашний регион установлен: {shown}")]
 
 
 # ------------------------------------------------------------------
