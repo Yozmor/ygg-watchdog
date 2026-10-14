@@ -798,6 +798,7 @@ struct WatchdogState {
     // egress-регион (автоопределение через GeoIP, кэш на час) - заменяют
     // старую эвристику "регион основных пиров", которая была неверной.
     std::wstring homeRegion;
+    std::wstring homeCity;     // ascii-имя города из cities.dat (пусто = любой город страны)
     std::wstring egressRegion;
     long long egressRegionCheckedAt = 0;
 
@@ -1119,6 +1120,7 @@ WatchdogState LoadState() {
             try { state.internetDownSince = std::stoll(value); } catch (...) { state.internetDownSince = 0; }
         }
         else if (key == L"home_region") state.homeRegion = value;
+        else if (key == L"home_city") state.homeCity = value;
         else if (key == L"egress_region") state.egressRegion = value;
         else if (key == L"egress_region_checked_at") {
             try { state.egressRegionCheckedAt = std::stoll(value); } catch (...) {}
@@ -1190,6 +1192,7 @@ void SaveState(const WatchdogState& state) {
     text += L"internet_down_since=" + std::to_wstring(state.internetDownSince) + L"\r\n";
 
     text += L"home_region=" + state.homeRegion + L"\r\n";
+    text += L"home_city=" + state.homeCity + L"\r\n";
     text += L"egress_region=" + state.egressRegion + L"\r\n";
     text += L"egress_region_checked_at=" + std::to_wstring(state.egressRegionCheckedAt) + L"\r\n";
 
@@ -1533,6 +1536,7 @@ std::vector<std::pair<std::wstring, std::wstring>> CheckDevices(WatchdogState& s
 }
 
 void CmdAddDevice(const std::wstring& name, const std::wstring& host) {
+    if (name.empty() || host.empty()) { LogError(L"Имя и адрес устройства не могут быть пустыми - устройство не добавлено."); return; }
     WatchdogState state = LoadState();
     for (auto& d : state.devices) {
         if (_wcsicmp(d.name.c_str(), name.c_str()) == 0) {
@@ -2180,33 +2184,98 @@ void CmdListCities(const std::wstring& countryInput) {
 }
 
 
-// countryInput == "" или "clear" - снять домашний регион
-void CmdSetHomeRegion(const std::wstring& countryInput) {
+// Номер из списка list-countries или slug -> slug (пусто, если номер вне списка)
+std::wstring ResolveCountryInput(const std::wstring& countryInput) {
+    try {
+        size_t idx = std::stoul(countryInput);
+        auto countryList = GetSortedCountryList();
+        if (idx >= 1 && idx <= countryList.size()) return countryList[idx - 1].slug;
+        return L"";
+    } catch (...) {
+        return countryInput; // не число - считаем, что это уже slug
+    }
+}
+
+// countryInput == "" или "clear" - снять домашний регион.
+// cityInput - номер из списка list-cities или точное название латиницей;
+// пусто - любой город страны (как раньше, без учёта расстояния).
+void CmdSetHomeRegion(const std::wstring& countryInput, const std::wstring& cityInput) {
     std::wstring lower = countryInput;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
     if (countryInput.empty() || lower == L"clear") {
         WatchdogState state = LoadState();
         state.homeRegion.clear();
+        state.homeCity.clear();
         SaveState(state);
         LogInfo(L"Домашний регион снят.");
         return;
     }
 
-    std::wstring countrySlug = countryInput;
-    try {
-        size_t idx = std::stoul(countryInput);
-        auto countryList = GetSortedCountryList();
-        if (idx >= 1 && idx <= countryList.size()) countrySlug = countryList[idx - 1].slug;
-    } catch (...) {}
-
-    if (!SlugToIso(countrySlug).has_value()) {
-        LogError(L"Неизвестная страна: '" + countrySlug + L"'. Список стран - команда list-countries.");
+    std::wstring countrySlug = ResolveCountryInput(countryInput);
+    auto isoOpt = SlugToIso(countrySlug);
+    if (countrySlug.empty() || !isoOpt.has_value()) {
+        LogError(L"Неизвестная страна: '" + countryInput + L"'. Список стран - команда list-countries.");
         return;
     }
+
+    std::wstring cityName;
+    std::wstring cityLabel;
+    if (!cityInput.empty()) {
+        auto db = LoadCityDatabase();
+        std::optional<City> city;
+        try {
+            size_t idx = std::stoul(cityInput);
+            auto cities = GetCitiesForCountry(db, *isoOpt);
+            if (idx >= 1 && idx <= cities.size()) city = cities[idx - 1];
+        } catch (...) {
+            city = FindCity(db, *isoOpt, cityInput);
+        }
+        if (!city.has_value()) {
+            LogError(L"Не удалось определить город по вводу '" + cityInput +
+                     L"'. Используй номер из списка (команда list-cities " + countrySlug + L").");
+            return;
+        }
+        cityName = city->name;
+        cityLabel = city->displayName();
+    }
+
     WatchdogState state = LoadState();
     state.homeRegion = countrySlug;
+    state.homeCity = cityName;
+    // Сбрасываем запомненный регион резервных - иначе при следующем падении
+    // поиск пошёл бы по старому региону, а не по новому домашнему.
+    if (state.backupPeers.empty()) state.backupRegion.clear();
     SaveState(state);
-    LogInfo(L"Домашний регион установлен: " + countrySlug + L" (" + SlugToRussianName(countrySlug) + L")");
+    LogInfo(L"Домашний регион установлен: " + SlugToRussianName(countrySlug) +
+            (cityLabel.empty() ? L" (любой город)" : L", " + cityLabel));
+}
+
+// Если резервные ищутся в стране домашнего региона и в нём задан город -
+// сортируем кандидатов по расстоянию до этого города (ближайшие первыми),
+// так же, как в региональном режиме. Пиры, чей город не найден в базе,
+// уходят в конец очереди, но не выбрасываются.
+void SortCandidatesByHomeCity(std::vector<PeerCandidate>& candidates, const WatchdogState& state,
+                              const std::wstring& region) {
+    if (state.homeCity.empty() || _wcsicmp(region.c_str(), state.homeRegion.c_str()) != 0) return;
+    auto isoOpt = SlugToIso(region);
+    if (!isoOpt.has_value()) return;
+    auto db = LoadCityDatabase();
+    auto home = FindCity(db, *isoOpt, state.homeCity);
+    if (!home.has_value()) {
+        LogDebug(L"Город домашнего региона '" + state.homeCity + L"' не найден в cities.dat - без сортировки");
+        return;
+    }
+    std::vector<ScoredPeer> scored;
+    for (const auto& p : candidates) {
+        auto pc = FindCity(db, *isoOpt, p.city);
+        double dist = pc.has_value() ? HaversineDistanceKm(home->lat, home->lon, pc->lat, pc->lon) : 1e9;
+        scored.push_back({ p, dist });
+    }
+    std::stable_sort(scored.begin(), scored.end(),
+                     [](const ScoredPeer& a, const ScoredPeer& b) { return a.distanceKm < b.distanceKm; });
+    candidates.clear();
+    for (const auto& sp : scored) candidates.push_back(sp.peer);
+    LogDebug(L"Кандидаты отсортированы по расстоянию до " + home->displayName());
 }
 
 void RemoveRegion() {
@@ -2490,6 +2559,7 @@ void Tick() {
     }
 
     auto candidates = FetchCountryPeers(state.backupRegion);
+    SortCandidatesByHomeCity(candidates, state, state.backupRegion);
     LogDebug(L"Кандидатов из репозитория для региона '" + state.backupRegion + L"': " +
              std::to_wstring(candidates.size()));
 
@@ -2742,7 +2812,7 @@ int RunInteractiveMenu() {
         PrintRaw(L"  4 - Показать основные пиры");
         PrintRaw(L"  5 - Убрать региональный режим (вернуться на основные пиры)");
         PrintRaw(L"  6 - Перезапустить службу Yggdrasil сейчас (обрыв связи по Yggdrasil!)");
-        PrintRaw(L"  7 - Задать домашний регион (постоянный fallback для резервных пиров)");
+        PrintRaw(L"  7 - Задать домашний регион (страна + город, запасной вариант для резервных пиров)");
         PrintRaw(L"  8 - Список устройств для мониторинга");
         PrintRaw(L"  9 - Добавить устройство для мониторинга");
         PrintRaw(L"  10 - Удалить устройство из мониторинга");
@@ -2774,10 +2844,24 @@ int RunInteractiveMenu() {
         } else if (choice == L"7") {
             CmdListCountries();
             PrintRaw(L"");
-            PrintRaw(L"Номер страны из списка выше: ");
+            PrintRaw(L"Номер страны из списка выше (пусто - снять домашний регион): ");
             std::wstring country;
             std::getline(std::wcin, country);
-            CmdSetHomeRegion(country);
+            if (country.empty()) {
+                CmdSetHomeRegion(L"", L"");
+            } else {
+                std::wstring slug = ResolveCountryInput(country);
+                if (slug.empty() || !SlugToIso(slug).has_value()) {
+                    PrintRaw(L"Неверный номер страны.");
+                } else {
+                    CmdListCities(slug);
+                    PrintRaw(L"");
+                    PrintRaw(L"Номер города (Enter - любой город страны): ");
+                    std::wstring city;
+                    std::getline(std::wcin, city);
+                    CmdSetHomeRegion(slug, city);
+                }
+            }
         } else if (choice == L"8") {
             CmdListDevices();
         } else if (choice == L"9") {
@@ -2951,7 +3035,7 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         RestartYggdrasilServiceDelayed(delay);
     } else if (command == L"set-home-region") {
-        CmdSetHomeRegion(args.size() >= 2 ? args[1] : L"");
+        CmdSetHomeRegion(args.size() >= 2 ? args[1] : L"", args.size() >= 3 ? args[2] : L"");
     } else if (command == L"list-devices") {
         CmdListDevices();
     } else if (command == L"add-device") {

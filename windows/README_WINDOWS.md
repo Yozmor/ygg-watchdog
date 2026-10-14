@@ -142,6 +142,11 @@ UAC - это ожидаемо (нужны для доступа к `yggdrasilctl
 сработало (нет сети наружу, сервисы недоступны). Покажет список стран
 и попросит номер; пустой ввод снимает домашний регион.
 
+Как и в региональном режиме, выбирается страна, а затем город из базы
+(Enter - любой город страны). Если город задан и резервные ищутся в
+этой же стране, первыми проверяются пиры, ближайшие к нему по
+координатам.
+
 ### Пункты 8-10 - Устройства для мониторинга
 Добровольно добавленные ноутбуки (не телефон), проверяются только
 после подтверждённой основной связности:
@@ -265,7 +270,7 @@ ygg_watchdog.exe list-cities <страна>
 ygg_watchdog.exe list-main-peers
 ygg_watchdog.exe add-main-peer tls://host:port
 ygg_watchdog.exe remove-main-peer 2
-ygg_watchdog.exe set-home-region russia       # без аргумента или "clear" - снять
+ygg_watchdog.exe set-home-region russia Moscow  # город необязателен; без аргумента или "clear" - снять
 ygg_watchdog.exe list-devices
 ygg_watchdog.exe add-device ThinkPad 200:1234:abcd::1
 ygg_watchdog.exe remove-device ThinkPad
