@@ -1,0 +1,7 @@
+mode=normal
+backup_peers=tcp://yggno.de:18226
+backup_region=russia
+regional_peers=
+regional_country=
+regional_city=
+internet_down_since=0
