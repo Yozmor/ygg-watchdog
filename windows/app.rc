@@ -1,2 +1,0 @@
-// Иконка программы. Собирается build-скриптом, если рядом лежит ygg-watchdog.ico
-1 ICON "ygg-watchdog.ico"
