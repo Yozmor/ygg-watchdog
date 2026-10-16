@@ -603,8 +603,11 @@ HINTERNET OpenHttpSessionWithProxy() {
     return hSession;
 }
 
+DWORD g_lastHttpStatus = 0;   // код ответа последнего HttpGetUtf8 (0 - не дошёл)
+
 std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path) {
     std::string result;
+    g_lastHttpStatus = 0;
 
     HINTERNET hSession = OpenHttpSessionWithProxy();
     if (!hSession) return result;
@@ -628,7 +631,11 @@ std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path) {
         WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
     }
-    if (received && statusCode != 200) {
+    g_lastHttpStatus = statusCode;
+    if (received && statusCode == 404) {
+        // для releases/latest это просто "релизов ещё нет" - не ошибка
+        LogDebug(L"HTTP 404 от " + host + path);
+    } else if (received && statusCode != 200) {
         // 403/429 у api.github.com - обычно лимит запросов без авторизации (60 в час)
         LogError(L"HTTP " + std::to_wstring(statusCode) + L" от " + host + path);
     } else if (received) {
@@ -1590,7 +1597,59 @@ bool CrisisScanStep(WatchdogState& state, const std::vector<std::wstring>& exclu
 // именно то, мешает ли нагрузка самому процессу/сокету Yggdrasil -
 // через время отклика getSelf - и если да, перезапускаем службу.
 // ------------------------------------------------------------------
-bool PingOnce(const std::wstring& host, int timeoutMs) {
+// Адрес в виде для SMB "201-831c-...-b93a.ipv6-literal.net" (через дефисы) ->
+// обычный IPv6 "201:831c:...:b93a". Иначе ping.exe его не поймёт.
+std::wstring NormalizeIpv6(std::wstring a) {
+    while (!a.empty() && (a.back() == L' ' || a.back() == L'\\')) a.pop_back();
+    while (!a.empty() && (a.front() == L' ' || a.front() == L'\\')) a.erase(0, 1);
+    static const std::wstring suf = L".ipv6-literal.net";
+    if (a.size() > suf.size() && _wcsicmp(a.c_str() + a.size() - suf.size(), suf.c_str()) == 0) {
+        a.resize(a.size() - suf.size());
+        for (auto& c : a) { if (c == L'-') c = L':'; else if (c == L's') c = L'%'; }
+    } else if (a.find(L':') == std::wstring::npos && a.find(L'-') != a.rfind(L'-')) {
+        bool hex = true;
+        for (wchar_t c : a) if (!(iswxdigit(c) || c == L'-')) { hex = false; break; }
+        if (hex) for (auto& c : a) if (c == L'-') c = L':';
+    }
+    return a;
+}
+
+// Открыт ли TCP-порт на устройстве (connect с таймаутом, ничего не отправляем)
+bool TcpPortOpen(const std::wstring& host, int port, int timeoutMs) {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    addrinfoW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfoW* res = nullptr;
+    if (GetAddrInfoW(host.c_str(), std::to_wstring(port).c_str(), &hints, &res) != 0 || !res) return false;
+    bool ok = false;
+    for (addrinfoW* ai = res; ai && !ok; ai = ai->ai_next) {
+        SOCKET sock = socket(ai->ai_family, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) continue;
+        u_long nb = 1;
+        ioctlsocket(sock, FIONBIO, &nb);
+        connect(sock, ai->ai_addr, (int)ai->ai_addrlen);
+        fd_set ws; FD_ZERO(&ws); FD_SET(sock, &ws);
+        timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+        if (select(0, nullptr, &ws, nullptr, &tv) > 0) {
+            int e = 0; int len = sizeof(e);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&e, &len);
+            ok = (e == 0);
+        }
+        closesocket(sock);
+    }
+    FreeAddrInfoW(res);
+    return ok;
+}
+
+bool PingOnce(const std::wstring& hostIn, int timeoutMs) {
+    std::wstring host = NormalizeIpv6(hostIn);
+    // Windows по умолчанию не отвечает на пинг (фаервол режет входящий ICMP), хотя
+    // SMB и RDP работают. Поэтому сначала пробуем порты SMB/RDP/SSH - любой ответ
+    // значит "устройство на связи"; пинг - только если все порты молчат.
+    for (int port : { 445, 3389, 22 })
+        if (TcpPortOpen(host, port, timeoutMs)) return true;
     std::wstring output = RunProcessCapture(L"ping.exe",
         L"-n 1 -w " + std::to_wstring(timeoutMs) + L" " + host);
     // ping.exe на успехе печатает "TTL=" в строке ответа (регистр и язык
@@ -1907,7 +1966,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.1.0"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.1.1"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -3736,7 +3795,9 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         ClearVpnApproval();
     } else if (command == L"check-update") {
         auto info = CheckForUpdate();
-        if (!info.has_value()) {
+        if (!info.has_value() && g_lastHttpStatus == 404) {
+            Print(L"На GitHub пока нет ни одного релиза - сравнивать не с чем (текущая: " + CURRENT_VERSION + L").");
+        } else if (!info.has_value()) {
             Print(L"Новых версий не найдено (текущая: " + CURRENT_VERSION + L").");
         } else {
             Print(L"Доступна новая версия: " + info->tag + L". " + info->url);
