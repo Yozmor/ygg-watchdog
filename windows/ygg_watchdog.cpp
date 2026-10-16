@@ -101,6 +101,23 @@ std::wstring NowTimestamp() {
 
 bool g_verboseMode = false;
 
+// Вывод в консоль, а если stdout перенаправлен (окно сторожа запускает
+// команды и читает их ответ через pipe) - UTF-8 через WriteFile.
+// WriteConsoleW в pipe не пишет, поэтому без этого окно видело бы пустоту.
+void WriteOut(const std::wstring& text) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == nullptr || hOut == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0, written = 0;
+    if (GetConsoleMode(hOut, &mode)) {
+        WriteConsoleW(hOut, text.c_str(), (DWORD)text.size(), &written, nullptr);
+        return;
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[0], n, nullptr, nullptr);
+    WriteFile(hOut, utf8.c_str(), (DWORD)utf8.size(), &written, nullptr);
+}
+
 void Log(const std::wstring& level, const std::wstring& message) {
     // DEBUG полностью скрыт по умолчанию (ни в консоль, ни в файл) -
     // только сама суть событий (что произошло, какие решения приняты).
@@ -112,10 +129,8 @@ void Log(const std::wstring& level, const std::wstring& message) {
 
     std::wstring line = L"[" + NowTimestamp() + L"] " + level + L": " + message;
 
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     std::wstring withNewline = line + L"\r\n";
-    DWORD written = 0;
-    WriteConsoleW(hOut, withNewline.c_str(), (DWORD)withNewline.size(), &written, nullptr);
+    WriteOut(withNewline);
 
     int size = WideCharToMultiByte(CP_UTF8, 0, withNewline.c_str(), -1, nullptr, 0, nullptr, nullptr);
     std::string utf8(size, 0);
@@ -129,6 +144,39 @@ void Log(const std::wstring& level, const std::wstring& message) {
 void LogInfo(const std::wstring& msg)  { Log(L"INFO", msg); }
 void LogError(const std::wstring& msg) { Log(L"ERROR", msg); }
 void LogDebug(const std::wstring& msg) { Log(L"DEBUG", msg); }
+
+// Только на экран, БЕЗ записи в watchdog.log. Для списков, справок и
+// ошибок ввода в ручных командах - чтобы лог оставался журналом работы
+// сторожа (тики + результаты ручных действий), а не копией консоли.
+void Print(const std::wstring& message) {
+    WriteOut(message + L"\r\n");
+}
+void PrintError(const std::wstring& message) { Print(L"Ошибка: " + message); }
+
+// ------------------------------------------------------------------
+// Журнал значимых событий (events.log рядом с exe) - для окна сторожа.
+// Одна строка = одно событие: unix-время <TAB> уровень <TAB> текст.
+// Уровни: ok (восстановилось), warn (обходной путь: резерв и т.п.),
+// alert (что-то легло), info (прочее). Пишется ВСЕГДА, даже если
+// Telegram не настроен.
+// ------------------------------------------------------------------
+std::wstring EventsPath()  { return GetExeDir() + L"events.log"; }
+std::wstring HistoryPath() { return GetExeDir() + L"history.log"; }
+
+void AppendUtf8Line(const std::wstring& path, const std::wstring& line) {
+    std::wstring withNewline = line + L"\r\n";
+    int size = WideCharToMultiByte(CP_UTF8, 0, withNewline.c_str(), (int)withNewline.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, withNewline.c_str(), (int)withNewline.size(), &utf8[0], size, nullptr, nullptr);
+    std::ofstream f(std::filesystem::path(path), std::ios::app | std::ios::binary);
+    if (f.is_open()) f.write(utf8.c_str(), utf8.size());
+}
+
+void AppendEvent(const std::wstring& level, const std::wstring& message) {
+    std::wstring clean = message;
+    for (auto& c : clean) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
+    AppendUtf8Line(EventsPath(), std::to_wstring((long long)time(nullptr)) + L"\t" + level + L"\t" + clean);
+}
 
 // ------------------------------------------------------------------
 // Чтение основных пиров прямо из yggdrasil.conf
@@ -230,9 +278,9 @@ void CmdListMainPeers() {
         return;
     }
     auto peers = ReadMainPeers(*configPath);
-    LogInfo(L"Основные пиры (" + std::to_wstring(peers.size()) + L"):");
+    Print(L"Основные пиры (" + std::to_wstring(peers.size()) + L"):");
     for (size_t i = 0; i < peers.size(); ++i) {
-        LogInfo(L"  " + std::to_wstring(i + 1) + L") " + peers[i]);
+        Print(L"  " + std::to_wstring(i + 1) + L") " + peers[i]);
     }
 }
 
@@ -242,12 +290,17 @@ void CmdAddMainPeer(const std::wstring& uri) {
         LogError(L"Не найден yggdrasil.conf");
         return;
     }
+    auto existing = ReadMainPeers(*configPath);
+    if (std::find(existing.begin(), existing.end(), uri) != existing.end()) {
+        PrintError(L"такой основной пир уже есть в конфиге: " + uri);
+        return;
+    }
     bool ok = ModifyMainPeers(*configPath, [&](std::vector<std::wstring>& peers) {
         peers.push_back(uri);
     });
     if (ok) {
-        LogInfo(L"Пир добавлен в конфиг: " + uri);
-        LogInfo(L"Изменения вступят в силу ТОЛЬКО после перезапуска службы Yggdrasil.");
+        LogInfo(L"Основной пир добавлен в конфиг: " + uri);
+        Print(L"Изменения вступят в силу ТОЛЬКО после перезапуска службы Yggdrasil.");
     }
 }
 
@@ -263,21 +316,23 @@ void CmdRemoveMainPeer(const std::wstring& indexStr) {
     try {
         idx = std::stoul(indexStr);
     } catch (...) {
-        LogError(L"Нужен номер пира из списка (команда list-main-peers)");
+        PrintError(L"нужен номер пира из списка (команда list-main-peers)");
         return;
     }
     if (idx < 1 || idx > currentPeers.size()) {
-        LogError(L"Нет пира с номером " + indexStr);
+        PrintError(L"нет пира с номером " + indexStr);
         return;
     }
     std::wstring toRemove = currentPeers[idx - 1];
 
+    // Удаляем ровно выбранную по номеру запись - если в конфиге есть
+    // дубли одного адреса, второй экземпляр остаётся.
     bool ok = ModifyMainPeers(*configPath, [&](std::vector<std::wstring>& peers) {
-        peers.erase(std::remove(peers.begin(), peers.end(), toRemove), peers.end());
+        if (idx - 1 < peers.size() && peers[idx - 1] == toRemove) peers.erase(peers.begin() + (idx - 1));
     });
     if (ok) {
-        LogInfo(L"Пир удалён из конфига: " + toRemove);
-        LogInfo(L"Изменения вступят в силу ТОЛЬКО после перезапуска службы Yggdrasil.");
+        LogInfo(L"Основной пир удалён из конфига: " + toRemove);
+        Print(L"Изменения вступят в силу ТОЛЬКО после перезапуска службы Yggdrasil.");
     }
 }
 
@@ -379,6 +434,8 @@ std::optional<std::wstring> GetPeerState(const std::wstring& uri,
     return std::nullopt;
 }
 
+bool PeerHasLastError(const std::wstring& uri);   // определена ниже, рядом с GetPeerDetails
+
 bool VerifyPeerHandshake(const std::wstring& uri) {
     AddPeer(uri);
     auto start = std::chrono::steady_clock::now();
@@ -392,6 +449,9 @@ bool VerifyPeerHandshake(const std::wstring& uri) {
             success = true;
             break;
         }
+        // Yggdrasil уже написал ошибку подключения (обрыв, отказ, таймаут) - ждать
+        // остаток времени нет смысла, пир не поднимется
+        if (PeerHasLastError(uri)) break;
         Sleep(HANDSHAKE_POLL_INTERVAL_MS);
     }
 
@@ -561,7 +621,17 @@ std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path) {
     BOOL sent = WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)headers.size(),
         WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
 
-    if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+    bool received = sent && WinHttpReceiveResponse(hRequest, nullptr);
+    DWORD statusCode = 0;
+    if (received) {
+        DWORD sz = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
+    }
+    if (received && statusCode != 200) {
+        // 403/429 у api.github.com - обычно лимит запросов без авторизации (60 в час)
+        LogError(L"HTTP " + std::to_wstring(statusCode) + L" от " + host + path);
+    } else if (received) {
         DWORD bytesAvailable = 0;
         do {
             bytesAvailable = 0;
@@ -575,7 +645,7 @@ std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path) {
             }
         } while (bytesAvailable > 0);
     } else {
-        LogError(L"HTTP-запрос не удался: " + host + path);
+        LogError(L"HTTP-запрос не удался (WinHTTP " + std::to_wstring(GetLastError()) + L"): " + host + path);
     }
 
     WinHttpCloseHandle(hRequest);
@@ -596,8 +666,72 @@ struct CountryFile {
     std::wstring rawUrlPath; // путь на raw.githubusercontent.com
 };
 
+// ------------------------------------------------------------------
+// Кэш базы пиров (папка peers_cache рядом с exe). Список стран и файлы
+// стран меняются редко: свежий кэш (до 6 ч) используется без запроса к
+// GitHub - это бережёт лимит api.github.com (60 запросов в час без
+// авторизации). Если GitHub недоступен - берём кэш любой давности:
+// старая база лучше, чем никакой, когда все пиры легли.
+// ------------------------------------------------------------------
+const long long PEER_CACHE_FRESH_SECONDS = 6 * 3600;
+
+std::wstring PeerCacheDir() { return GetExeDir() + L"peers_cache\\"; }
+
+// Возраст файла в секундах, -1 если файла нет
+long long FileAgeSeconds(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return -1;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    ULARGE_INTEGER a, b;
+    a.LowPart = fad.ftLastWriteTime.dwLowDateTime; a.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    b.LowPart = nowFt.dwLowDateTime; b.HighPart = nowFt.dwHighDateTime;
+    if (b.QuadPart < a.QuadPart) return 0;
+    return (long long)((b.QuadPart - a.QuadPart) / 10000000ULL);
+}
+
+std::string ReadBytes(const std::wstring& path) {
+    std::ifstream f(std::filesystem::path(path), std::ios::binary);
+    if (!f.is_open()) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+void WriteBytes(const std::wstring& path, const std::string& data) {
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(PeerCacheDir()), ec);
+    std::ofstream f(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+    if (f.is_open()) f.write(data.c_str(), data.size());
+}
+
+// Получить через кэш: свежий кэш -> без сети; иначе сеть; при неудаче - старый кэш
+std::string FetchCached(const std::wstring& cacheName, const std::wstring& host, const std::wstring& path,
+                        const std::string& mustContain) {
+    std::wstring cachePath = PeerCacheDir() + cacheName;
+    long long age = FileAgeSeconds(cachePath);
+    if (age >= 0 && age < PEER_CACHE_FRESH_SECONDS) {
+        std::string cached = ReadBytes(cachePath);
+        if (!cached.empty()) return cached;
+    }
+    std::string fresh = HttpGetUtf8(host, path);
+    if (!fresh.empty() && (mustContain.empty() || fresh.find(mustContain) != std::string::npos)) {
+        WriteBytes(cachePath, fresh);
+        return fresh;
+    }
+    if (age >= 0) {
+        std::string cached = ReadBytes(cachePath);
+        if (!cached.empty()) {
+            LogInfo(L"GitHub недоступен - использую сохранённую базу пиров (" + cacheName + L", возраст " +
+                    std::to_wstring(age / 3600) + L" ч)");
+            return cached;
+        }
+    }
+    return "";
+}
+
 std::vector<CountryFile> ListCountryFiles() {
-    std::string response = HttpGetUtf8(GITHUB_API_HOST, GITHUB_TREE_PATH);
+    std::string response = FetchCached(L"tree.json", GITHUB_API_HOST, GITHUB_TREE_PATH, "\"tree\"");
     std::vector<CountryFile> result;
     if (response.empty()) return result;
 
@@ -651,36 +785,15 @@ std::vector<PeerCandidate> FetchCountryPeers(const std::wstring& countrySlug) {
         }
     }
     if (targetPath.empty()) {
-        LogError(L"Страна не найдена в репозитории: " + countrySlug);
+        if (files.empty()) {
+            LogError(L"Нет списка стран: GitHub недоступен, а сохранённой базы пиров ещё нет");
+        } else {
+            LogError(L"Страна не найдена в репозитории: " + countrySlug);
+        }
         return result;
     }
 
-    std::string raw = [&]() {
-        std::string r;
-        // raw.githubusercontent.com не требует авторизации/User-Agent так же
-        // жёстко, но всё равно передаём на всякий случай
-        HINTERNET hSession = OpenHttpSessionWithProxy();
-        if (!hSession) return r;
-        HINTERNET hConnect = WinHttpConnect(hSession, GITHUB_RAW_HOST.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!hConnect) { WinHttpCloseHandle(hSession); return r; }
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", targetPath.c_str(),
-            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (hRequest && WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-            && WinHttpReceiveResponse(hRequest, nullptr)) {
-            DWORD avail = 0;
-            do {
-                avail = 0;
-                if (!WinHttpQueryDataAvailable(hRequest, &avail) || avail == 0) break;
-                std::vector<char> buf(avail);
-                DWORD readBytes = 0;
-                if (WinHttpReadData(hRequest, buf.data(), avail, &readBytes)) r.append(buf.data(), readBytes);
-            } while (avail > 0);
-        }
-        if (hRequest) WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return r;
-    }();
+    std::string raw = FetchCached(countrySlug + L".md", GITHUB_RAW_HOST, targetPath, "://");
 
     int size = MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), nullptr, 0);
     std::wstring text(size, 0);
@@ -822,6 +935,18 @@ struct WatchdogState {
     // Проверка обновлений с GitHub (только уведомление)
     long long updateLastCheckedAt = 0;
     std::wstring updateNotifiedTag;
+
+    // Итог последней проверки - для окна сторожа (status-json)
+    long long lastTickAt = 0;
+    bool outageNotified = false; // уже сообщили "все пиры легли, замены нет" в этом простое
+    std::wstring lastPhase; // ok / backup / down / crisis / no_internet / battery / regional / regional_search / error
+
+    // Разбор "почему не работают основные пиры": считается в конце проверки (уже после
+    // поиска замены) и кладётся сюда, а status-json только отдаёт готовое - окно
+    // опрашивает его каждые несколько секунд, лишних сетевых проверок там быть не должно.
+    std::wstring diagVerdict, diagAdvice;
+    bool diagAnyUp = false;
+    std::vector<std::wstring> diagPeers;   // "uri<TAB>kind<TAB>text<TAB>error"
 };
 
 // ------------------------------------------------------------------
@@ -956,6 +1081,12 @@ bool SendTelegramNotification(const std::wstring& message) {
         LogDebug(L"Не удалось отправить уведомление в Telegram");
     }
     return ok;
+}
+
+// Значимое событие: в журнал событий (для окна сторожа) и в Telegram.
+void Notify(const std::wstring& level, const std::wstring& message) {
+    AppendEvent(level, message);
+    SendTelegramNotification(message);
 }
 
 struct City {
@@ -1167,6 +1298,15 @@ WatchdogState LoadState() {
             try { state.updateLastCheckedAt = std::stoll(value); } catch (...) {}
         }
         else if (key == L"update_notified_tag") state.updateNotifiedTag = value;
+        else if (key == L"last_tick_at") {
+            try { state.lastTickAt = std::stoll(value); } catch (...) {}
+        }
+        else if (key == L"last_phase") state.lastPhase = value;
+        else if (key == L"outage_notified") state.outageNotified = (value == L"1");
+        else if (key == L"diag_verdict") state.diagVerdict = value;
+        else if (key == L"diag_advice") state.diagAdvice = value;
+        else if (key == L"diag_any_up") state.diagAnyUp = (value == L"1");
+        else if (key == L"diag_peer") state.diagPeers.push_back(value);
     }
     return state;
 }
@@ -1235,6 +1375,13 @@ void SaveState(const WatchdogState& state) {
     text += L"battery_critical_entered_percent=" + std::to_wstring(state.batteryCriticalEnteredPercent) + L"\r\n";
     text += L"update_last_checked_at=" + std::to_wstring(state.updateLastCheckedAt) + L"\r\n";
     text += L"update_notified_tag=" + state.updateNotifiedTag + L"\r\n";
+    text += L"last_tick_at=" + std::to_wstring(state.lastTickAt) + L"\r\n";
+    text += L"last_phase=" + state.lastPhase + L"\r\n";
+    text += L"outage_notified=" + std::wstring(state.outageNotified ? L"1" : L"0") + L"\r\n";
+    text += L"diag_verdict=" + state.diagVerdict + L"\r\n";
+    text += L"diag_advice=" + state.diagAdvice + L"\r\n";
+    text += L"diag_any_up=" + std::wstring(state.diagAnyUp ? L"1" : L"0") + L"\r\n";
+    for (const auto& dp : state.diagPeers) text += L"diag_peer=" + dp + L"\r\n";
 
     int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(size, 0);
@@ -1379,7 +1526,7 @@ bool CrisisScanStep(WatchdogState& state, const std::vector<std::wstring>& exclu
         state.crisisPeerIndex = 0;
         LogInfo(L"=== Крайний перебор: начинаю полный перебор пиров по всем странам (" +
                 std::to_wstring(state.crisisCountrySlugs.size()) + L") ===");
-        SendTelegramNotification(L"Крайний перебор: обычный поиск резервного пира не сработал. "
+        Notify(L"warn", L"Крайний перебор: обычный поиск резервного пира не сработал. "
                                   L"Начинаю полный перебор пиров по всем странам в фоне.");
     }
 
@@ -1407,7 +1554,7 @@ bool CrisisScanStep(WatchdogState& state, const std::vector<std::wstring>& exclu
                 LogInfo(L"Крайний перебор: проверяю " + candidate.uri + L" (" + slug + L"/" + candidate.city + L")");
                 if (VerifyPeerHandshake(candidate.uri)) {
                     LogInfo(L"  Up - добавляю как резервного (крайний перебор)");
-                    SendTelegramNotification(L"Крайний перебор: найден рабочий пир - " + candidate.uri +
+                    Notify(L"ok", L"Крайний перебор: найден рабочий пир - " + candidate.uri +
                                               L" (" + slug + L"/" + candidate.city + L")");
                     AddPeer(candidate.uri);
                     state.backupPeers.push_back(candidate.uri);
@@ -1426,7 +1573,7 @@ bool CrisisScanStep(WatchdogState& state, const std::vector<std::wstring>& exclu
     LogError(L"Крайний перебор: полный перебор всех стран завершён, рабочий пир не найден. "
              L"Программа НЕ трогает фаервол сама - только читает правила и сообщает, "
              L"остальное - руками.");
-    SendTelegramNotification(L"Крайний перебор: полный перебор всех пиров завершён без результата.");
+    Notify(L"alert", L"Крайний перебор: полный перебор всех пиров завершён без результата.");
     state.crisisLastFullScanCompletedAt = (long long)time(nullptr);
     state.crisisCountrySlugs.clear();
     state.crisisCountryIndex = 0;
@@ -1536,7 +1683,7 @@ std::vector<std::pair<std::wstring, std::wstring>> CheckDevices(WatchdogState& s
 }
 
 void CmdAddDevice(const std::wstring& name, const std::wstring& host) {
-    if (name.empty() || host.empty()) { LogError(L"Имя и адрес устройства не могут быть пустыми - устройство не добавлено."); return; }
+    if (name.empty() || host.empty()) { PrintError(L"имя и адрес устройства не могут быть пустыми - устройство не добавлено."); return; }
     WatchdogState state = LoadState();
     for (auto& d : state.devices) {
         if (_wcsicmp(d.name.c_str(), name.c_str()) == 0) {
@@ -1557,7 +1704,7 @@ void CmdRemoveDevice(const std::wstring& name) {
     state.devices.erase(std::remove_if(state.devices.begin(), state.devices.end(),
         [&](const Device& d) { return _wcsicmp(d.name.c_str(), name.c_str()) == 0; }), state.devices.end());
     if (state.devices.size() == before) {
-        LogError(L"Устройство не найдено: " + name);
+        PrintError(L"устройство не найдено: " + name);
         return;
     }
     state.deviceDownSince.erase(name);
@@ -1569,13 +1716,13 @@ void CmdRemoveDevice(const std::wstring& name) {
 void CmdListDevices() {
     WatchdogState state = LoadState();
     if (state.devices.empty()) {
-        LogInfo(L"Устройств для мониторинга не добавлено.");
+        Print(L"Устройств для мониторинга не добавлено.");
         return;
     }
-    LogInfo(L"Устройства для мониторинга (" + std::to_wstring(state.devices.size()) + L"):");
+    Print(L"Устройства для мониторинга (" + std::to_wstring(state.devices.size()) + L"):");
     for (const auto& d : state.devices) {
         bool down = state.deviceDownSince.count(d.name) > 0;
-        LogInfo(L"  " + d.name + L" (" + d.host + L")" + (down ? L" - НЕДОСТУПНО" : L" - ок"));
+        Print(L"  " + d.name + L" (" + d.host + L")" + (down ? L" - НЕДОСТУПНО" : L" - ок"));
     }
 }
 
@@ -1622,7 +1769,7 @@ bool CheckBattery(WatchdogState& state) {
             std::wstring(status->charging ? L"да" : L"нет") +
             L") - аварийный режим по батарее выключен, проверки возобновлены.";
         LogInfo(msg);
-        SendTelegramNotification(msg);
+        Notify(L"ok", msg);
         return true;
     }
 
@@ -1632,7 +1779,7 @@ bool CheckBattery(WatchdogState& state) {
         std::wstring msg = L"Заряд " + std::to_wstring(status->percent) + L"% (не на зарядке) - "
             L"вхожу в аварийный режим по батарее, все проверки выключены до восстановления заряда.";
         LogInfo(msg);
-        SendTelegramNotification(msg);
+        Notify(L"alert", msg);
         return false;
     }
 
@@ -1683,7 +1830,7 @@ std::optional<std::wstring> Sha256HexOfFile(const std::wstring& path) {
 
 bool ApproveVpnCommand(const std::wstring& scriptPath) {
     if (GetFileAttributesW(scriptPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        LogError(L"Файл скрипта не найден: " + scriptPath);
+        PrintError(L"файл скрипта не найден: " + scriptPath);
         return false;
     }
     auto hash = Sha256HexOfFile(scriptPath);
@@ -1825,7 +1972,7 @@ void CheckForUpdateIfDue(WatchdogState& state) {
         L" (текущая: " + CURRENT_VERSION + L"). Подробности: " + info->url +
         L". Чтобы обновиться - команда apply-update (или пункт меню).";
     LogInfo(msg);
-    SendTelegramNotification(msg);
+    Notify(L"info", msg);
 }
 
 bool DownloadFile(const std::wstring& url, const std::wstring& destPath) {
@@ -1995,6 +2142,9 @@ std::vector<CountryEntry> GetSortedCountryList() {
     auto files = ListCountryFiles();
     std::vector<CountryEntry> entries;
     for (const auto& f : files) {
+        // i2p, lokinet и tor - не страны, а пиры внутри анонимных сетей
+        // (адреса вида .i2p / .onion): обычным TCP не достать и города у них нет
+        if (f.slug == L"i2p" || f.slug == L"lokinet" || f.slug == L"tor") continue;
         CountryEntry e;
         e.slug = f.slug;
         e.ruName = SlugToRussianName(f.slug);
@@ -2086,6 +2236,8 @@ void AddRegionWorker(const std::wstring& countryInput, const std::wstring& cityN
             state.regionalCity = cityName;
             SaveState(state);
             LogInfo(L"=== Региональный пир найден и добавлен ===");
+            AppendEvent(L"info", L"Региональный пир (" + countrySlug + L"/" + destCity->name + L"): " +
+                        sp.peer.uri + L" (" + sp.peer.city + L")");
             return;
         } else {
             LogInfo(L"  не поднялся за отведённое время, пробую следующего");
@@ -2093,6 +2245,7 @@ void AddRegionWorker(const std::wstring& countryInput, const std::wstring& cityN
     }
 
     LogError(L"Не удалось найти рабочего регионального пира для " + countrySlug + L"/" + cityName);
+    AppendEvent(L"alert", L"Не удалось найти рабочего регионального пира для " + countrySlug + L"/" + destCity->name);
 }
 
 // Спавнит фоновый процесс (сам себя же с командой add-region-worker) и
@@ -2113,9 +2266,9 @@ void AddRegionForeground(const std::wstring& countrySlug, const std::wstring& ci
                         CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        LogInfo(L"Поиск пиров для региона '" + countrySlug + L"/" + cityName +
-                L"' запущен в фоне. Прогресс смотри в watchdog.log, обычно занимает от "
-                L"нескольких секунд до пары минут в зависимости от числа кандидатов.");
+        LogInfo(L"Запущен фоновый поиск пиров для региона '" + countrySlug + L"/" + cityName + L"'");
+        Print(L"Прогресс смотри в watchdog.log, обычно занимает от нескольких секунд "
+              L"до пары минут в зависимости от числа кандидатов.");
     } else {
         LogError(L"Не удалось запустить фоновый процесс поиска региона");
     }
@@ -2126,19 +2279,19 @@ void AddRegionForeground(const std::wstring& countrySlug, const std::wstring& ci
 // не гадать с транслитерацией/точным написанием при вводе региона.
 // ------------------------------------------------------------------
 void CmdListCountries() {
-    LogInfo(L"Загружаю список стран из репозитория GitHub...");
+    Print(L"Загружаю список стран из репозитория GitHub...");
     auto entries = GetSortedCountryList();
     if (entries.empty()) {
-        LogError(L"Не удалось получить список стран - проверь интернет-соединение");
+        PrintError(L"Не удалось получить список стран - проверь интернет-соединение");
         return;
     }
 
-    LogInfo(L"Доступные страны (" + std::to_wstring(entries.size()) + L"):");
+    Print(L"Доступные страны (" + std::to_wstring(entries.size()) + L"):");
     for (size_t i = 0; i < entries.size(); ++i) {
-        LogInfo(L"  " + std::to_wstring(i + 1) + L") " + entries[i].ruName +
+        Print(L"  " + std::to_wstring(i + 1) + L") " + entries[i].ruName +
                 (entries[i].supported ? L"" : L" (координаты пока не поддерживаются)"));
     }
-    LogInfo(L"Вводи НОМЕР страны из списка выше (не название).");
+    Print(L"Вводи НОМЕР страны из списка выше (не название).");
 }
 
 // Общая логика: города страны, отсортированные по убыванию населения,
@@ -2161,7 +2314,7 @@ void CmdListCities(const std::wstring& countryInput) {
 
     auto isoOpt = SlugToIso(countrySlug);
     if (!isoOpt.has_value()) {
-        LogError(L"Неизвестная страна: '" + countrySlug + L"'. Список стран - команда list-countries.");
+        PrintError(L"Неизвестная страна: '" + countrySlug + L"'. Список стран - команда list-countries.");
         return;
     }
     std::wstring iso = *isoOpt;
@@ -2170,17 +2323,17 @@ void CmdListCities(const std::wstring& countryInput) {
     auto cities = GetCitiesForCountry(db, iso);
 
     if (cities.empty()) {
-        LogError(L"Городов для страны '" + countrySlug + L"' (" + iso + L") не найдено в cities.dat");
+        PrintError(L"Городов для страны '" + countrySlug + L"' (" + iso + L") не найдено в cities.dat");
         return;
     }
 
-    LogInfo(L"Города для '" + countrySlug + L"' (" + iso + L"), всего " +
+    Print(L"Города для '" + countrySlug + L"' (" + iso + L"), всего " +
             std::to_wstring(cities.size()) + L", по алфавиту:");
     for (size_t i = 0; i < cities.size(); ++i) {
-        LogInfo(L"  " + std::to_wstring(i + 1) + L") " + cities[i].displayLabel() +
+        Print(L"  " + std::to_wstring(i + 1) + L") " + cities[i].displayLabel() +
                 L" (население: " + std::to_wstring(cities[i].population) + L")");
     }
-    LogInfo(L"Вводи НОМЕР города из списка выше (не название) - например: 1");
+    Print(L"Вводи НОМЕР города из списка выше (не название) - например: 1");
 }
 
 
@@ -2214,7 +2367,7 @@ void CmdSetHomeRegion(const std::wstring& countryInput, const std::wstring& city
     std::wstring countrySlug = ResolveCountryInput(countryInput);
     auto isoOpt = SlugToIso(countrySlug);
     if (countrySlug.empty() || !isoOpt.has_value()) {
-        LogError(L"Неизвестная страна: '" + countryInput + L"'. Список стран - команда list-countries.");
+        PrintError(L"Неизвестная страна: '" + countryInput + L"'. Список стран - команда list-countries.");
         return;
     }
 
@@ -2231,7 +2384,7 @@ void CmdSetHomeRegion(const std::wstring& countryInput, const std::wstring& city
             city = FindCity(db, *isoOpt, cityInput);
         }
         if (!city.has_value()) {
-            LogError(L"Не удалось определить город по вводу '" + cityInput +
+            PrintError(L"Не удалось определить город по вводу '" + cityInput +
                      L"'. Используй номер из списка (команда list-cities " + countrySlug + L").");
             return;
         }
@@ -2289,6 +2442,7 @@ void RemoveRegion() {
     state.regionalCity.clear();
     SaveState(state);
     LogInfo(L"Региональный режим выключен, возврат к обычному слежению за основными пирами");
+    AppendEvent(L"info", L"Региональный режим выключен вручную");
 }
 
 
@@ -2361,6 +2515,7 @@ bool CheckInternet(WatchdogState& state) {
     if (!ok) {
         if (state.internetDownSince == 0) {
             state.internetDownSince = (long long)time(nullptr);
+            AppendEvent(L"alert", L"Пропал интернет целиком - замену пирам не ищу, жду восстановления.");
             LogInfo(L"Похоже, пропал интернет целиком (не только Yggdrasil-пиры). "
                     L"Поиск замены пирам не имеет смысла, пока нет сети вообще - жду восстановления.");
         }
@@ -2388,13 +2543,105 @@ bool CheckInternet(WatchdogState& state) {
                                 L" до " + std::wstring(upBuf) + L" (простой " +
                                 std::to_wstring(minutes) + L" мин " + std::to_wstring(seconds) + L" сек).";
         LogInfo(message);
-        SendTelegramNotification(message);
+        Notify(L"ok", message);
     }
 
     return true;
 }
 
-void Tick() {
+int PortFromUri(const std::wstring& uri) {
+    std::wregex re(L"://(?:\\[[^\\]]+\\]|[^:/]+):(\\d+)");
+    std::wsmatch m;
+    if (std::regex_search(uri, m, re)) { try { return std::stoi(m[1].str()); } catch (...) {} }
+    return 0;
+}
+
+struct ProbeJob {
+    std::wstring host;
+    int port = 0;
+    double ms = -1;        // -1 = не подключился
+    std::wstring err;      // dns / timeout / refused
+};
+
+DWORD WINAPI ProbeThread(LPVOID p) {
+    ProbeJob* j = (ProbeJob*)p;
+    addrinfoW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfoW* res = nullptr;
+    if (GetAddrInfoW(j->host.c_str(), std::to_wstring(j->port).c_str(), &hints, &res) != 0 || !res) {
+        j->err = L"dns";
+        return 0;
+    }
+    j->err = L"timeout";
+    for (addrinfoW* ai = res; ai; ai = ai->ai_next) {
+        SOCKET sock = socket(ai->ai_family, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) continue;
+        u_long nb = 1;
+        ioctlsocket(sock, FIONBIO, &nb);
+        LARGE_INTEGER f, t0, t1;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        connect(sock, ai->ai_addr, (int)ai->ai_addrlen);
+        fd_set ws, es;
+        FD_ZERO(&ws); FD_SET(sock, &ws);
+        FD_ZERO(&es); FD_SET(sock, &es);
+        timeval tv{ 3, 0 };
+        int rc = select(0, nullptr, &ws, &es, &tv);
+        QueryPerformanceCounter(&t1);
+        if (rc > 0 && FD_ISSET(sock, &ws)) {
+            int e = 0; int len = sizeof(e);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&e, &len);
+            if (e == 0) {
+                j->ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+                j->err.clear();
+                closesocket(sock);
+                break;
+            }
+            j->err = L"refused";
+        } else if (rc > 0) {
+            j->err = L"refused";
+        }
+        closesocket(sock);
+    }
+    FreeAddrInfoW(res);
+    return 0;
+}
+
+// Параллельно пробует TCP-порты всех кандидатов (до ~4 с на всех). Результат - по одному
+// ProbeJob на кандидата в том же порядке. quic:// по TCP не проверить - err = "udp".
+std::vector<ProbeJob> ProbePeers(const std::vector<PeerCandidate>& candidates) {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    // Память намеренно не освобождается: если какой-то поток завис дольше ожидания,
+    // он не должен писать в уже освобождённый вектор.
+    std::vector<ProbeJob>* jobs = new std::vector<ProbeJob>(candidates.size());
+    std::vector<HANDLE> threads;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const std::wstring& uri = candidates[i].uri;
+        std::wstring proto = uri.substr(0, uri.find(L"://"));
+        (*jobs)[i].host = HostFromUri(uri);
+        (*jobs)[i].port = PortFromUri(uri);
+        if (_wcsicmp(proto.c_str(), L"quic") == 0) { (*jobs)[i].err = L"udp"; continue; }
+        if ((*jobs)[i].host.empty() || (*jobs)[i].port == 0) { (*jobs)[i].err = L"bad"; continue; }
+        HANDLE h = CreateThread(nullptr, 64 * 1024, ProbeThread, &(*jobs)[i], STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (h) threads.push_back(h); else ProbeThread(&(*jobs)[i]);
+    }
+    for (size_t i = 0; i < threads.size(); i += MAXIMUM_WAIT_OBJECTS) {
+        DWORD n = (DWORD)(std::min)((size_t)MAXIMUM_WAIT_OBJECTS, threads.size() - i);
+        WaitForMultipleObjects(n, &threads[i], TRUE, 15000);
+    }
+    for (HANDLE h : threads) CloseHandle(h);
+    return *jobs;
+}
+
+std::wstring g_tickPhase;
+
+// Разбор "почему нет связи" (определён ниже, рядом с историей).
+std::wstring DiagnoseNowText(const std::vector<std::wstring>& mainPeers);
+
+void TickInner() {
+    g_tickPhase = L"error";
     CleanOldLogEntries();
     LogInfo(L"=== Начало проверки ===");
 
@@ -2406,6 +2653,7 @@ void Tick() {
     if (!CheckBattery(state)) {
         SaveState(state);
         LogInfo(L"Аварийный режим по батарее активен - остальные проверки этого тика пропущены.");
+        g_tickPhase = L"battery";
         return;
     }
 
@@ -2422,6 +2670,7 @@ void Tick() {
         bool internetOk = CheckInternet(state);
         SaveState(state);
         if (!internetOk) {
+            g_tickPhase = L"no_internet";
             return;
         }
     }
@@ -2460,7 +2709,7 @@ void Tick() {
             auto deviceEvents = CheckDevices(state);
             for (const auto& [kind, msg] : deviceEvents) {
                 LogInfo(msg);
-                SendTelegramNotification(msg);
+                Notify(kind == L"device_recovered" ? L"ok" : L"alert", msg);
             }
             SaveState(state);
         }
@@ -2479,13 +2728,16 @@ void Tick() {
         }
         if (anyRegionalUp) {
             LogInfo(L"Проверка выполнена: региональный пир жив, без изменений");
+            g_tickPhase = L"regional";
             return;
         }
 
         if (!CheckInternet(state)) {
             SaveState(state);
+            g_tickPhase = L"no_internet";
             return;
         }
+        g_tickPhase = L"regional_search";
 
         LogInfo(L"Все региональные пиры легли - запускаю фоновый поиск замены для " +
                 state.regionalCountry + L"/" + state.regionalCity);
@@ -2516,7 +2768,7 @@ void Tick() {
                 if (i > 0) removedList += L", ";
                 removedList += state.backupPeers[i];
             }
-            SendTelegramNotification(L"Основной пир снова в строю. Удалены резервные: " + removedList);
+            Notify(L"ok", L"Основной пир снова в строю. Удалены резервные: " + removedList);
             for (const auto& uri : state.backupPeers) {
                 RemovePeer(uri);
             }
@@ -2526,6 +2778,8 @@ void Tick() {
         } else {
             LogInfo(L"Проверка выполнена: основные пиры живы, без изменений");
         }
+        if (state.outageNotified) { state.outageNotified = false; SaveState(state); }
+        g_tickPhase = L"ok";
         return;
     }
 
@@ -2533,15 +2787,29 @@ void Tick() {
     for (const auto& p : state.backupPeers) {
         if (isUp(p)) { anyBackupUp = true; break; }
     }
+    // Мёртвые резервные не копим: убираем из Yggdrasil и из списка - иначе каждая
+    // проверка добавляла бы нового, а старые так и висели бы (было "резервных: 11").
+    {
+        std::vector<std::wstring> keep;
+        for (const auto& p : state.backupPeers) {
+            if (isUp(p)) keep.push_back(p);
+            else { LogInfo(L"Резервный не работает - убираю: " + p); RemovePeer(p); }
+        }
+        if (keep.size() != state.backupPeers.size()) { state.backupPeers = keep; SaveState(state); }
+    }
     if (anyBackupUp) {
         LogInfo(L"Основные легли, но резервный держит связь - без изменений");
+        if (state.outageNotified) { state.outageNotified = false; SaveState(state); }
+        g_tickPhase = L"backup";
         return;
     }
 
     LogInfo(L"Все основные и резервные пиры легли - ищу замену");
+    g_tickPhase = L"down";
 
     if (!CheckInternet(state)) {
         SaveState(state);
+        g_tickPhase = L"no_internet";
         return;
     }
 
@@ -2552,6 +2820,13 @@ void Tick() {
         if (state.backupRegion.empty()) {
             LogError(L"Не удалось определить регион ни через GeoIP, ни через домашний регион, "
                      L"ни по стране основных пиров - поиск резервного невозможен");
+            if (!state.outageNotified) {
+                state.outageNotified = true;
+                SaveState(state);
+                Notify(L"alert", L"Все пиры легли, а регион для поиска замены не определён "
+                                 L"(GeoIP не ответил, домашний регион не задан). Задай домашний регион.\n\n"
+                                 L"Разбор: " + DiagnoseNowText(mainPeers));
+            }
             return;
         }
         LogInfo(L"Регион определён и сохранён: " + state.backupRegion);
@@ -2562,6 +2837,23 @@ void Tick() {
     SortCandidatesByHomeCity(candidates, state, state.backupRegion);
     LogDebug(L"Кандидатов из репозитория для региона '" + state.backupRegion + L"': " +
              std::to_wstring(candidates.size()));
+    size_t candidatesTotal = candidates.size();
+
+    // Сначала быстро (параллельно, пара секунд) смотрим, у кого вообще открыт порт: у
+    // остальных рукопожатие заведомо не пройдёт, а ждать его - до 15 с на каждого.
+    // Порядок по близости к городу сохраняется; quic:// по TCP не проверить - идёт после.
+    if (!candidates.empty()) {
+        auto jobs = ProbePeers(candidates);
+        std::vector<PeerCandidate> open, other;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (jobs[i].ms >= 0) open.push_back(candidates[i]);
+            else if (jobs[i].err == L"udp") other.push_back(candidates[i]);
+        }
+        LogInfo(L"Порт отвечает у " + std::to_wstring(open.size()) + L" из " + std::to_wstring(candidates.size()) + L" пиров региона");
+        candidates = open;
+        candidates.insert(candidates.end(), other.begin(), other.end());
+    }
+    int triedThisTick = 0;
 
     for (const auto& candidate : candidates) {
         bool alreadyTried = false;
@@ -2569,6 +2861,10 @@ void Tick() {
         for (const auto& p : state.backupPeers) if (p == candidate.uri) alreadyTried = true;
         if (alreadyTried) continue;
 
+        if (++triedThisTick > 8) {
+            LogInfo(L"Проверено восемь пиров за эту проверку - продолжу в следующую, чтобы не держать проверку долго.");
+            break;
+        }
         LogInfo(L"Проверяю рукопожатие: " + candidate.uri + L" (" + candidate.city + L")");
         if (VerifyPeerHandshake(candidate.uri)) {
             LogInfo(L"  Up - добавляю как резервного");
@@ -2577,12 +2873,13 @@ void Tick() {
                 if (i > 0) mainPeersList += L", ";
                 mainPeersList += mainPeers[i];
             }
-            SendTelegramNotification(L"Все основные пиры (" + mainPeersList + L") легли. "
+            Notify(L"warn", L"Все основные пиры (" + mainPeersList + L") легли. "
                                       L"Добавлен резервный (" + state.backupRegion + L"): " +
                                       candidate.uri + L" (" + candidate.city + L")");
             AddPeer(candidate.uri);
             state.backupPeers.push_back(candidate.uri);
             SaveState(state);
+            g_tickPhase = L"backup";
             return;
         } else {
             LogInfo(L"  не поднялся за отведённое время, пробую следующего");
@@ -2590,6 +2887,15 @@ void Tick() {
     }
 
     LogError(L"Не удалось найти рабочего резервного пира для региона '" + state.backupRegion + L"'.");
+    if (!state.outageNotified) {
+        state.outageNotified = true;
+        SaveState(state);
+        std::wstring why = candidatesTotal == 0
+            ? L"база пиров недоступна (GitHub не отвечает, сохранённой базы нет)"
+            : L"ни один из " + std::to_wstring(candidatesTotal) + L" пиров региона '" + state.backupRegion + L"' не поднялся";
+        Notify(L"alert", L"Все пиры легли (основные и резервные), замену найти не удалось: " + why +
+                         L". Дальше - крайний перебор.\n\nРазбор: " + DiagnoseNowText(mainPeers));
+    }
 
     // VPN: продвинутый вариант (одобренный скрипт) - пробуем перезапустить
     // перед крайней мерой (крайним перебором); если скрипт не одобрен - только намёк в лог.
@@ -2604,7 +2910,7 @@ void Tick() {
     auto firewallNote = CheckFirewallDiagnostics();
     if (firewallNote.has_value()) {
         LogError(L"Фаервол: " + *firewallNote);
-        SendTelegramNotification(L"Возможная причина проблемы: " + *firewallNote);
+        Notify(L"alert", L"Возможная причина проблемы: " + *firewallNote);
     }
 
     // Крайняя мера, последняя надежда - перебор ВСЕХ пиров по всем
@@ -2612,8 +2918,507 @@ void Tick() {
     std::vector<std::wstring> excludeHosts;
     for (const auto& p : mainPeers) excludeHosts.push_back(HostFromUri(p));
     for (const auto& p : state.backupPeers) excludeHosts.push_back(HostFromUri(p));
-    CrisisScanStep(state, excludeHosts);
+    bool found = CrisisScanStep(state, excludeHosts);
     SaveState(state);
+    g_tickPhase = found ? L"backup" : L"crisis";
+}
+
+// Обёртка: сама проверка + запись итога (время, фаза) в state.txt и
+// строки истории в history.log - для окна сторожа.
+void RecordHistory(const std::wstring& phase);
+
+void UpdateDiagnosisState(WatchdogState& st, const std::wstring& phase);   // ниже, рядом с Diagnose
+
+void Tick() {
+    // Одна проверка за раз: окно, Планировщик и консоль могут запустить её одновременно.
+    // Вторая не должна лезть в те же пиры и state.txt - просто пропускает ход.
+    HANDLE lockH = CreateMutexW(nullptr, TRUE, L"Global\\YggWatchdogTickLock");
+    if (lockH && GetLastError() == ERROR_ALREADY_EXISTS) {
+        LogInfo(L"Предыдущая проверка ещё идёт - эту пропускаю.");
+        CloseHandle(lockH);
+        return;
+    }
+    TickInner();
+    WatchdogState st = LoadState();
+    st.lastTickAt = (long long)time(nullptr);
+    st.lastPhase = g_tickPhase;
+    // Диагностика - в самом конце, когда поиск замены уже закончен
+    UpdateDiagnosisState(st, g_tickPhase);
+    SaveState(st);
+    RecordHistory(g_tickPhase);
+    if (lockH) { ReleaseMutex(lockH); CloseHandle(lockH); }
+}
+
+
+// ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// История для окна сторожа: одна строка на тик в history.log -
+//   unix-время <TAB> фаза <TAB> интернет(1/0) <TAB> пир=U|мс;пир=D|-1;...
+// Задержка - из getPeers в JSON. Храним ~48 часов.
+// ------------------------------------------------------------------
+struct PeerDetail {
+    std::wstring uri;
+    bool up = false;
+    double rttMs = -1;      // -1 = неизвестно
+    std::wstring lastError; // "last_error" из getPeers - почему пир не поднимается
+};
+
+// getPeers в JSON (yggdrasilctl -json, Yggdrasil 0.5.x): массив "peers"
+// из плоских объектов; "latency" - в НАНОСЕКУНДАХ, есть только у Up-пиров.
+std::vector<PeerDetail> GetPeerDetails() {
+    std::vector<PeerDetail> result;
+    std::wstring out = RunYggCtl(L"-json getPeers");
+    std::wregex objRe(L"\\{[^{}]*\\}");
+    std::wregex remoteRe(L"\"remote\"\\s*:\\s*\"([^\"]*)\"");
+    std::wregex upRe(L"\"up\"\\s*:\\s*(true|false)");
+    std::wregex latRe(L"\"latency\"\\s*:\\s*([0-9.eE+]+)");
+    std::wregex errRe(L"\"last_error\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+    for (auto it = std::wsregex_iterator(out.begin(), out.end(), objRe); it != std::wsregex_iterator(); ++it) {
+        std::wstring obj = it->str();
+        std::wsmatch m;
+        if (!std::regex_search(obj, m, remoteRe)) continue;
+        PeerDetail d;
+        d.uri = m[1].str();
+        if (std::regex_search(obj, m, upRe)) d.up = (m[1].str() == L"true");
+        if (d.up && std::regex_search(obj, m, latRe)) {
+            try { d.rttMs = std::stod(m[1].str()) / 1e6; } catch (...) {}
+        }
+        if (std::regex_search(obj, m, errRe)) d.lastError = m[1].str();
+        result.push_back(d);
+    }
+    return result;
+}
+
+
+bool PeerHasLastError(const std::wstring& uri) {
+    for (const auto& d : GetPeerDetails())
+        if (_wcsicmp(d.uri.c_str(), uri.c_str()) == 0) return !d.up && !d.lastError.empty();
+    return false;
+}
+
+// ------------------------------------------------------------------
+// Разбор "почему нет связи": по last_error каждого основного пира
+// (что сказал сам Yggdrasil) плюс пара быстрых проверок - есть ли
+// интернет, работает ли DNS. Только чтение, ничего не меняет.
+// ------------------------------------------------------------------
+struct PeerDiag {
+    std::wstring uri;
+    std::wstring kind;   // up / dns / eof / timeout / refused / unreachable / tls / waiting / absent / other
+    std::wstring text;   // по-человечески
+    std::wstring error;  // как есть от Yggdrasil
+};
+struct Diagnosis {
+    std::vector<PeerDiag> peers;
+    std::wstring verdict;  // одна строка: что случилось
+    std::wstring advice;   // одна строка: что делать
+    bool anyUp = false;
+};
+
+bool DnsWorks() {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    const char* names[] = { "github.com", "cloudflare.com" };
+    for (const char* n : names) {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(n, "443", &hints, &res) == 0) { freeaddrinfo(res); WSACleanup(); return true; }
+    }
+    WSACleanup();
+    return false;
+}
+
+static bool HasCI(const std::wstring& hay, const wchar_t* needle) {
+    std::wstring h = hay, n = needle;
+    for (auto& c : h) c = towlower(c);
+    for (auto& c : n) c = towlower(c);
+    return h.find(n) != std::wstring::npos;
+}
+
+static void ClassifyPeerError(PeerDiag& pd) {
+    const std::wstring& e = pd.error;
+    if (e.empty())                                   { pd.kind = L"waiting";     pd.text = L"ещё подключается, ошибки пока нет"; }
+    else if (HasCI(e, L"no such host") || HasCI(e, L"lookup"))
+                                                     { pd.kind = L"dns";         pd.text = L"имя сервера не находится (DNS)"; }
+    else if (HasCI(e, L"EOF") || HasCI(e, L"reset by peer") || HasCI(e, L"forcibly closed") || HasCI(e, L"wsarecv"))
+                                                     { pd.kind = L"eof";         pd.text = L"сервер обрывает соединение (EOF)"; }
+    else if (HasCI(e, L"timeout") || HasCI(e, L"timed out") || HasCI(e, L"deadline"))
+                                                     { pd.kind = L"timeout";     pd.text = L"сервер не отвечает (таймаут)"; }
+    else if (HasCI(e, L"refused") || HasCI(e, L"actively refused"))
+                                                     { pd.kind = L"refused";     pd.text = L"порт закрыт (соединение отклонено)"; }
+    else if (HasCI(e, L"unreachable") || HasCI(e, L"no route"))
+                                                     { pd.kind = L"unreachable"; pd.text = L"нет маршрута до сервера"; }
+    else if (HasCI(e, L"tls") || HasCI(e, L"certificate") || HasCI(e, L"handshake"))
+                                                     { pd.kind = L"tls";         pd.text = L"не прошло рукопожатие (TLS / ключ)"; }
+    else                                             { pd.kind = L"other";       pd.text = L"ошибка: " + e; }
+}
+
+// internet: 1 - точно есть, 0 - точно нет, -1 - проверить самому
+Diagnosis Diagnose(const std::vector<std::wstring>& mainPeers, const std::vector<PeerDetail>& details, int internet = -1) {
+    Diagnosis dg;
+    int nDns = 0, nEof = 0, nTimeout = 0, nRefused = 0, nUnreach = 0, nTls = 0, nOther = 0, nWait = 0, nAbsent = 0;
+    for (const auto& uri : mainPeers) {
+        PeerDiag pd;
+        pd.uri = uri;
+        const PeerDetail* found = nullptr;
+        for (const auto& d : details) if (_wcsicmp(d.uri.c_str(), uri.c_str()) == 0) { found = &d; break; }
+        if (!found) { pd.kind = L"absent"; pd.text = L"Yggdrasil не знает этот пир (служба не перечитала конфиг?)"; ++nAbsent; }
+        else if (found->up) { pd.kind = L"up"; pd.text = L"работает"; dg.anyUp = true; }
+        else {
+            pd.error = found->lastError;
+            ClassifyPeerError(pd);
+            if (pd.kind == L"dns") ++nDns; else if (pd.kind == L"eof") ++nEof; else if (pd.kind == L"timeout") ++nTimeout;
+            else if (pd.kind == L"refused") ++nRefused; else if (pd.kind == L"unreachable") ++nUnreach;
+            else if (pd.kind == L"tls") ++nTls; else if (pd.kind == L"waiting") ++nWait; else ++nOther;
+        }
+        dg.peers.push_back(pd);
+    }
+
+    if (mainPeers.empty()) {
+        dg.verdict = L"В конфиге нет основных пиров.";
+        dg.advice = L"Добавь хотя бы два пира на вкладке «пиры».";
+        return dg;
+    }
+    if (dg.anyUp) {
+        int dead = nDns + nEof + nTimeout + nRefused + nUnreach + nTls + nOther + nAbsent;
+        dg.verdict = dead == 0 ? L"Связь есть, все основные пиры работают."
+                               : L"Связь есть, но " + std::to_wstring(dead) + L" из " + std::to_wstring(mainPeers.size()) + L" основных пиров не работают.";
+        dg.advice = dead == 0 ? L"" : L"Пока держит хотя бы один пир, всё в порядке. Мёртвые лучше заменить.";
+        return dg;
+    }
+    bool netOk = internet < 0 ? HasInternetConnectivity() : internet == 1;
+    if (!netOk) {
+        dg.verdict = L"Нет интернета вообще - дело не в пирах.";
+        dg.advice = L"Проверь Wi-Fi или кабель, роутер, VPN. Сторож сам заметит, когда сеть вернётся.";
+        return dg;
+    }
+    int total = (int)mainPeers.size();
+    if (nDns > 0) {
+        bool dnsOk = DnsWorks();
+        if (!dnsOk) {
+            dg.verdict = L"Не работает DNS на этом компьютере: имена серверов не находятся.";
+            dg.advice = L"Проверь DNS в настройках сети или VPN. Пиры с IP-адресом вместо имени работают и без DNS.";
+            return dg;
+        }
+        if (nDns == total) {
+            dg.verdict = L"DNS работает, но имён всех основных пиров больше нет - сервера, похоже, закрылись.";
+            dg.advice = L"Замени основные пиры: выбери новые в каталоге (вкладка «пиры»).";
+            return dg;
+        }
+    }
+    if (nTimeout + nUnreach == total) {
+        dg.verdict = L"Сервера пиров не отвечают: похоже, провайдер или фаервол режет эти соединения.";
+        dg.advice = L"Попробуй пиры на портах 443/80, пиры с tls:// или quic://, либо через VPN.";
+        return dg;
+    }
+    if (nEof == total) {
+        dg.verdict = L"Сервера принимают соединение и сразу обрывают его.";
+        dg.advice = L"Так бывает при DPI-блокировке или перегрузке сервера. Попробуй tls:// пиры или другие сервера.";
+        return dg;
+    }
+    if (nRefused == total) {
+        dg.verdict = L"Сервера живы, но порты пиров закрыты - Yggdrasil на них больше не работает.";
+        dg.advice = L"Замени основные пиры.";
+        return dg;
+    }
+    if (nWait == total) {
+        dg.verdict = L"Yggdrasil только что запущен или переподключается - ошибок пока нет.";
+        dg.advice = L"Подожди пару минут.";
+        return dg;
+    }
+    if (nAbsent == total) {
+        dg.verdict = L"Пиров из конфига нет в работающем Yggdrasil.";
+        dg.advice = L"Перезапусти службу Yggdrasil, чтобы она перечитала конфиг.";
+        return dg;
+    }
+    std::wstring parts;
+    auto add = [&](int n, const wchar_t* what) { if (n) { if (!parts.empty()) parts += L", "; parts += std::to_wstring(n) + L" - " + what; } };
+    add(nDns, L"имя не находится"); add(nEof, L"обрыв"); add(nTimeout, L"таймаут"); add(nRefused, L"порт закрыт");
+    add(nUnreach, L"нет маршрута"); add(nTls, L"TLS"); add(nOther, L"другое"); add(nWait, L"подключается"); add(nAbsent, L"нет в службе");
+    dg.verdict = L"Все основные пиры не работают, причины разные: " + parts + L".";
+    dg.advice = L"Замени мёртвые пиры на живые из каталога.";
+    return dg;
+}
+
+std::wstring DiagnosisShort(const Diagnosis& dg);
+
+// Кладёт разбор в state (или очищает, если основные пиры в порядке или не проверяются)
+void UpdateDiagnosisState(WatchdogState& st, const std::wstring& phase) {
+    st.diagVerdict.clear(); st.diagAdvice.clear(); st.diagPeers.clear(); st.diagAnyUp = false;
+    bool mainDown = phase == L"backup" || phase == L"down" || phase == L"crisis" || phase == L"no_internet";
+    if (!mainDown) return;
+    std::vector<std::wstring> mp;
+    auto cfg = FindConfigPath();
+    if (cfg.has_value()) mp = ReadMainPeers(*cfg);
+    Diagnosis dg = Diagnose(mp, GetPeerDetails(), phase == L"no_internet" ? 0 : 1);
+    auto clean = [](std::wstring t) { for (auto& c : t) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' '; return t; };
+    st.diagVerdict = clean(dg.verdict);
+    st.diagAdvice = clean(dg.advice);
+    st.diagAnyUp = dg.anyUp;
+    for (const auto& p : dg.peers)
+        st.diagPeers.push_back(clean(p.uri) + L"\t" + clean(p.kind) + L"\t" + clean(p.text) + L"\t" + clean(p.error));
+}
+
+std::wstring DiagnoseNowText(const std::vector<std::wstring>& mainPeers) {
+    return DiagnosisShort(Diagnose(mainPeers, GetPeerDetails()));
+}
+
+std::wstring DiagnosisShort(const Diagnosis& dg) {
+    std::wstring s = dg.verdict;
+    for (const auto& p : dg.peers) if (p.kind != L"up") s += L"\n- " + HostFromUri(p.uri) + L": " + p.text;
+    if (!dg.advice.empty()) s += L"\n" + dg.advice;
+    return s;
+}
+
+const long long HISTORY_RETENTION_SECONDS = 48 * 3600;
+
+void PruneHistoryIfLarge() {
+    std::error_code ec;
+    auto size = std::filesystem::file_size(std::filesystem::path(HistoryPath()), ec);
+    if (ec || size < 400 * 1024) return;
+    std::wstring content = ReadFileUtf8(HistoryPath());
+    long long cutoff = (long long)time(nullptr) - HISTORY_RETENTION_SECONDS;
+    std::wstring kept;
+    for (auto line : SplitBy(content, L'\n')) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty()) continue;
+        long long ts = 0;
+        try { ts = std::stoll(line.substr(0, line.find(L'\t'))); } catch (...) { continue; }
+        if (ts >= cutoff) kept += line + L"\r\n";
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, kept.c_str(), (int)kept.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, kept.c_str(), (int)kept.size(), &utf8[0], n, nullptr, nullptr);
+    std::ofstream out(std::filesystem::path(HistoryPath()), std::ios::trunc | std::ios::binary);
+    if (out.is_open()) out.write(utf8.c_str(), utf8.size());
+}
+
+void RecordHistory(const std::wstring& phase) {
+    WatchdogState st = LoadState();
+    bool internet = (st.internetDownSince == 0) && phase != L"no_internet";
+    std::wstring peers;
+    if (phase != L"battery") {
+        for (const auto& d : GetPeerDetails()) {
+            if (!peers.empty()) peers += L";";
+            std::wstringstream rtt;
+            rtt << std::fixed << std::setprecision(1) << d.rttMs;
+            peers += d.uri + L"=" + (d.up ? L"U|" : L"D|") + (d.rttMs < 0 ? std::wstring(L"-1") : rtt.str());
+        }
+    }
+    AppendUtf8Line(HistoryPath(), std::to_wstring((long long)time(nullptr)) + L"\t" + phase + L"\t" +
+                   (internet ? L"1" : L"0") + L"\t" + peers);
+    PruneHistoryIfLarge();
+}
+
+// ------------------------------------------------------------------
+// status-json: всё, что знает сторож, одним JSON - для окна сторожа и
+// панели Иггдрасиля. Только чтение, ничего не меняет и не пишет в лог.
+// ------------------------------------------------------------------
+std::wstring JsonEscape(const std::wstring& s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'"': r += L"\\\""; break;
+            case L'\\': r += L"\\\\"; break;
+            case L'\n': r += L"\\n"; break;
+            case L'\r': r += L"\\r"; break;
+            case L'\t': r += L"\\t"; break;
+            default:
+                if (c < 0x20) { const wchar_t* hx = L"0123456789abcdef"; r += L"\\u00"; r += hx[(c >> 4) & 0xF]; r += hx[c & 0xF]; }
+                else r += c;
+        }
+    }
+    return r;
+}
+std::wstring JStr(const std::wstring& s) { return L"\"" + JsonEscape(s) + L"\""; }
+std::wstring JArr(const std::vector<std::wstring>& v) {
+    std::wstring r = L"[";
+    for (size_t i = 0; i < v.size(); ++i) { if (i) r += L","; r += JStr(v[i]); }
+    return r + L"]";
+}
+
+void CmdStatusJson() {
+    WatchdogState st = LoadState();
+    std::vector<std::wstring> mainPeers;
+    auto cfg = FindConfigPath();
+    if (cfg.has_value()) mainPeers = ReadMainPeers(*cfg);
+    auto bat = ReadBatteryStatus();
+    bool vpnApproved = !ReadFileUtf8(VpnApprovalPath()).empty();
+    bool notifyOn = LoadNotifyConfig().valid;
+    long long now = (long long)time(nullptr);
+    long long cooldownUntil = st.crisisLastFullScanCompletedAt ? st.crisisLastFullScanCompletedAt + CRISIS_SCAN_COOLDOWN_SECONDS : 0;
+
+    std::wstring j = L"{";
+    j += L"\"version\":" + JStr(CURRENT_VERSION);
+    j += L",\"device\":" + JStr(GetDeviceName());
+    j += L",\"now\":" + std::to_wstring(now);
+    j += L",\"last_tick_at\":" + std::to_wstring(st.lastTickAt);
+    j += L",\"tick_interval_sec\":180";
+    j += L",\"last_phase\":" + JStr(st.lastPhase);
+    j += L",\"mode\":" + JStr(st.mode);
+    j += L",\"config_found\":" + std::wstring(cfg.has_value() ? L"true" : L"false");
+    j += L",\"main_peers\":" + JArr(mainPeers);
+    j += L",\"backup_peers\":" + JArr(st.backupPeers);
+    j += L",\"backup_region\":" + JStr(st.backupRegion);
+    j += L",\"regional_peers\":" + JArr(st.regionalPeers);
+    j += L",\"regional_country\":" + JStr(st.regionalCountry);
+    j += L",\"regional_city\":" + JStr(st.regionalCity);
+    j += L",\"home_region\":" + JStr(st.homeRegion);
+    j += L",\"home_city\":" + JStr(st.homeCity);
+    j += L",\"egress_region\":" + JStr(st.egressRegion);
+    j += L",\"internet_down_since\":" + std::to_wstring(st.internetDownSince);
+    j += L",\"crisis\":{\"countries_total\":" + std::to_wstring(st.crisisCountrySlugs.size()) +
+         L",\"country_index\":" + std::to_wstring(st.crisisCountryIndex) +
+         L",\"peer_index\":" + std::to_wstring(st.crisisPeerIndex) +
+         L",\"current_country\":" + JStr(st.crisisCountryIndex < st.crisisCountrySlugs.size() ? st.crisisCountrySlugs[st.crisisCountryIndex] : L"") +
+         L",\"cooldown_until\":" + std::to_wstring(cooldownUntil) + L"}";
+    j += L",\"devices\":[";
+    for (size_t i = 0; i < st.devices.size(); ++i) {
+        const auto& d = st.devices[i];
+        auto it = st.deviceDownSince.find(d.name);
+        if (i) j += L",";
+        j += L"{\"name\":" + JStr(d.name) + L",\"host\":" + JStr(d.host) +
+             L",\"down_since\":" + std::to_wstring(it == st.deviceDownSince.end() ? 0 : it->second) + L"}";
+    }
+    j += L"]";
+    j += L",\"battery\":";
+    if (bat.has_value()) {
+        j += L"{\"percent\":" + std::to_wstring(bat->percent) + L",\"charging\":" + (bat->charging ? L"true" : L"false") + L"}";
+    } else {
+        j += L"null";
+    }
+    j += L",\"battery_critical_mode\":" + std::wstring(st.batteryCriticalMode ? L"true" : L"false");
+    j += L",\"update_available\":" + JStr(st.updateNotifiedTag);
+    j += L",\"vpn_script_approved\":" + std::wstring(vpnApproved ? L"true" : L"false");
+    j += L",\"telegram_configured\":" + std::wstring(notifyOn ? L"true" : L"false");
+    {   // разбор - готовый, из state (считается в конце проверки)
+        j += L",\"diagnosis\":{\"verdict\":" + JStr(st.diagVerdict) + L",\"advice\":" + JStr(st.diagAdvice) +
+             L",\"any_up\":" + std::wstring(st.diagAnyUp ? L"true" : L"false") + L",\"peers\":[";
+        bool first = true;
+        for (const auto& line : st.diagPeers) {
+            std::vector<std::wstring> f;
+            size_t pos = 0;
+            for (int k = 0; k < 3; ++k) { size_t t = line.find(L'\t', pos); if (t == std::wstring::npos) break; f.push_back(line.substr(pos, t - pos)); pos = t + 1; }
+            if (f.size() < 3) continue;
+            if (!first) j += L",";
+            first = false;
+            j += L"{\"uri\":" + JStr(f[0]) + L",\"kind\":" + JStr(f[1]) + L",\"text\":" + JStr(f[2]) +
+                 L",\"error\":" + JStr(line.substr(pos)) + L"}";
+        }
+        j += L"]}";
+    }
+    j += L",\"files\":{\"log\":" + JStr(LogPath()) + L",\"events\":" + JStr(EventsPath()) +
+         L",\"history\":" + JStr(HistoryPath()) + L",\"state\":" + JStr(StatePath()) + L"}";
+    j += L"}";
+
+    WriteOut(j + L"\n");
+}
+
+// Списки для окна сторожа (выбор региона) - JSON, только чтение.
+void CmdCountriesJson() {
+    auto entries = GetSortedCountryList();
+    std::wstring j = L"[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) j += L",";
+        j += L"{\"slug\":" + JStr(entries[i].slug) + L",\"name\":" + JStr(entries[i].ruName) +
+             L",\"supported\":" + (entries[i].supported ? L"true" : L"false") + L"}";
+    }
+    WriteOut(j + L"]\n");
+}
+
+
+// ------------------------------------------------------------------
+// catalog-json <страна>: публичные пиры страны из репозитория с
+// задержкой TCP-подключения (время connect до host:port). Это не пинг
+// Yggdrasil, а грубая оценка "жив ли сервер и далеко ли он". quic://
+// работает по UDP - его так не проверить. Только чтение.
+// ------------------------------------------------------------------
+void CmdCatalogJson(const std::wstring& countrySlug) {
+    auto candidates = FetchCountryPeers(countrySlug);
+    std::vector<ProbeJob> jobs = ProbePeers(candidates);
+
+    std::vector<size_t> order(candidates.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        double ma = jobs[a].ms, mb = jobs[b].ms;
+        if ((ma >= 0) != (mb >= 0)) return ma >= 0;
+        if (ma >= 0) return ma < mb;
+        return false;
+    });
+
+    std::wstring j = L"[";
+    for (size_t k = 0; k < order.size(); ++k) {
+        size_t i = order[k];
+        if (k) j += L",";
+        std::wstringstream ms;
+        ms << std::fixed << std::setprecision(1) << jobs[i].ms;
+        j += L"{\"uri\":" + JStr(candidates[i].uri) + L",\"city\":" + JStr(candidates[i].city) +
+             L",\"tcp_ms\":" + (jobs[i].ms >= 0 ? ms.str() : std::wstring(L"-1")) +
+             L",\"err\":" + JStr(jobs[i].err) + L"}";
+    }
+    WriteOut(j + L"]\n");
+}
+
+
+// ------------------------------------------------------------------
+// verify-peer <uri>: настоящая проверка пира. Открытый TCP-порт ещё ничего
+// не значит (сервер может принять соединение и сразу его оборвать), поэтому
+// пир на несколько секунд подключается к самому Yggdrasil, и смотрим, что
+// скажет getPeers: поднялся ли он, какая задержка, какая ошибка. Если пир
+// уже в списке (основной / резервный) - ничего не добавляем, берём как есть.
+// Результат - одна строка JSON в конце вывода.
+// ------------------------------------------------------------------
+void CmdVerifyPeer(const std::wstring& uri) {
+    auto find = [&](const std::vector<PeerDetail>& v) -> const PeerDetail* {
+        for (const auto& d : v) if (_wcsicmp(d.uri.c_str(), uri.c_str()) == 0) return &d;
+        return nullptr;
+    };
+    bool alreadyThere = find(GetPeerDetails()) != nullptr;
+    bool up = false;
+    double ms = -1;
+    std::wstring err;
+    if (!alreadyThere) AddPeer(uri);
+    auto start = std::chrono::steady_clock::now();
+    int upSeen = 0;
+    for (;;) {
+        auto details = GetPeerDetails();
+        const PeerDetail* d = find(details);
+        if (d) {
+            up = d->up;
+            ms = d->rttMs;
+            err = d->lastError;
+            if (up && ++upSeen >= 2) break;      // дали ещё одну секунду, чтобы появилась задержка
+            if (up && ms > 0) break;
+        }
+        long long el = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        if (el >= HANDSHAKE_TIMEOUT_MS || (alreadyThere && !up) || (!up && !err.empty())) break;
+        Sleep(1000);
+    }
+    if (!alreadyThere) RemovePeer(uri);
+    std::wstringstream msS;
+    msS << std::fixed << std::setprecision(1) << ms;
+    PeerDiag pd;
+    pd.error = err;
+    if (!up) ClassifyPeerError(pd);
+    WriteOut(L"{\"uri\":" + JStr(uri) + L",\"up\":" + (up ? L"true" : L"false") + L",\"ms\":" + (ms >= 0 ? msS.str() : std::wstring(L"-1")) +
+             L",\"error\":" + JStr(err) + L",\"text\":" + JStr(up ? L"" : pd.text) +
+             L",\"was_configured\":" + (alreadyThere ? L"true" : L"false") + L"}\n");
+}
+
+void CmdCitiesJson(const std::wstring& countrySlug) {
+    std::wstring j = L"[";
+    auto iso = SlugToIso(countrySlug);
+    if (iso.has_value()) {
+        auto db = LoadCityDatabase();
+        auto cities = GetCitiesForCountry(db, *iso);
+        for (size_t i = 0; i < cities.size(); ++i) {
+            if (i) j += L",";
+            j += L"{\"name\":" + JStr(cities[i].name) + L",\"label\":" + JStr(cities[i].displayLabel()) +
+                 L",\"population\":" + std::to_wstring(cities[i].population) + L"}";
+        }
+    }
+    WriteOut(j + L"]\n");
 }
 
 // ------------------------------------------------------------------
@@ -2648,13 +3453,13 @@ void RunSimpleCommand(const std::wstring& cmd) {
 }
 
 void RestartYggdrasilServiceNow() {
-    LogInfo(L"Перезапускаю службу Yggdrasil немедленно...");
-    LogInfo(L"Внимание: если подключён к этому компьютеру ЧЕРЕЗ Yggdrasil - "
-            L"соединение сейчас оборвётся. Если это твой единственный канал - "
-            L"используй отложенный перезапуск вместо этого.");
+    Print(L"Перезапускаю службу Yggdrasil немедленно...");
+    Print(L"Внимание: если подключён к этому компьютеру ЧЕРЕЗ Yggdrasil - "
+          L"соединение сейчас оборвётся. Если это твой единственный канал - "
+          L"используй отложенный перезапуск вместо этого.");
     RunSimpleCommand(L"net stop \"" + std::wstring(YGG_SERVICE_NAME) + L"\"");
     RunSimpleCommand(L"net start \"" + std::wstring(YGG_SERVICE_NAME) + L"\"");
-    LogInfo(L"Перезапуск выполнен.");
+    LogInfo(L"Служба Yggdrasil перезапущена вручную.");
 }
 
 void RestartYggdrasilServiceDelayed(int delaySeconds) {
@@ -2684,7 +3489,7 @@ void InstallScheduledTask() {
     std::wstring cmd = L"schtasks /Create /TN \"YggWatchdogTick\" /TR \"\\\"" +
         std::wstring(exePath) + L"\\\" tick\" /SC MINUTE /MO 3 /RL HIGHEST /RU SYSTEM /F";
 
-    LogInfo(L"Регистрирую задачу планировщика...");
+    Print(L"Регистрирую задачу планировщика...");
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
@@ -2718,6 +3523,12 @@ void InstallScheduledTask() {
                 L"$t.Settings.StartWhenAvailable = $true; "
                 L"$t.Settings.DisallowStartIfOnBatteries = $false; "
                 L"$t.Settings.StopIfGoingOnBatteries = $false; "
+                // Зависшая проверка не должна блокировать следующие: по
+                // умолчанию Планировщик не запускает новый экземпляр, пока
+                // жив старый, а лимит у schtasks - 72 часа. Одна проверка
+                // (с крайним перебором, у него свой бюджет 90 с) укладывается
+                // в минуты - 10 минут с запасом.
+                L"$t.Settings.ExecutionTimeLimit = 'PT10M'; "
                 L"Set-ScheduledTask -InputObject $t\"";
 
             STARTUPINFOW psSi = { sizeof(psSi) };
@@ -2755,7 +3566,7 @@ void InstallScheduledTask() {
 void UninstallScheduledTask() {
     std::wstring cmd = L"schtasks /Delete /TN \"YggWatchdogTick\" /F";
 
-    LogInfo(L"Удаляю задачу планировщика (останавливаю автоматические проверки)...");
+    Print(L"Удаляю задачу планировщика (останавливаю автоматические проверки)...");
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
@@ -2778,133 +3589,6 @@ void UninstallScheduledTask() {
     }
 }
 
-// ------------------------------------------------------------------
-// Консольное меню - показывается, когда программу запускают без
-// аргументов (двойной клик по exe). Раньше в этом случае exe просто
-// печатал подсказку по использованию и сразу завершался - окно
-// консоли закрывалось мгновенно, создавая впечатление, что программа
-// "не открывается" без .bat-обёртки. Теперь вместо этого показываем
-// обычное интерактивное меню и ждём Enter после каждого действия.
-// ------------------------------------------------------------------
-void PrintRaw(const std::wstring& s) {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    std::wstring withNewline = s + L"\r\n";
-    DWORD written = 0;
-    WriteConsoleW(hOut, withNewline.c_str(), (DWORD)withNewline.size(), &written, nullptr);
-}
-
-void WaitForEnter() {
-    PrintRaw(L"");
-    PrintRaw(L"Нажми Enter, чтобы продолжить...");
-    std::wstring dummy;
-    std::getline(std::wcin, dummy);
-}
-
-int RunInteractiveMenu() {
-    while (true) {
-        PrintRaw(L"================================================");
-        PrintRaw(L"         YGG WATCHDOG");
-        PrintRaw(L"================================================");
-        PrintRaw(L"");
-        PrintRaw(L"  1 - Проверить сейчас (tick)");
-        PrintRaw(L"  2 - Установить/переустановить задачу автозапуска");
-        PrintRaw(L"  3 - Остановить задачу автозапуска (удалить из планировщика)");
-        PrintRaw(L"  4 - Показать основные пиры");
-        PrintRaw(L"  5 - Убрать региональный режим (вернуться на основные пиры)");
-        PrintRaw(L"  6 - Перезапустить службу Yggdrasil сейчас (обрыв связи по Yggdrasil!)");
-        PrintRaw(L"  7 - Задать домашний регион (страна + город, запасной вариант для резервных пиров)");
-        PrintRaw(L"  8 - Список устройств для мониторинга");
-        PrintRaw(L"  9 - Добавить устройство для мониторинга");
-        PrintRaw(L"  10 - Удалить устройство из мониторинга");
-        PrintRaw(L"  11 - Одобрить VPN-скрипт (продвинутый режим)");
-        PrintRaw(L"  12 - Снять одобрение VPN-скрипта");
-        PrintRaw(L"  13 - Проверить обновления на GitHub");
-        PrintRaw(L"  14 - Скачать и применить обновление");
-        PrintRaw(L"  0 - Выход");
-        PrintRaw(L"");
-        PrintRaw(L"Выбор: ");
-
-        std::wstring choice;
-        if (!std::getline(std::wcin, choice)) {
-            break;
-        }
-
-        if (choice == L"1") {
-            Tick();
-        } else if (choice == L"2") {
-            InstallScheduledTask();
-        } else if (choice == L"3") {
-            UninstallScheduledTask();
-        } else if (choice == L"4") {
-            CmdListMainPeers();
-        } else if (choice == L"5") {
-            RemoveRegion();
-        } else if (choice == L"6") {
-            RestartYggdrasilServiceNow();
-        } else if (choice == L"7") {
-            CmdListCountries();
-            PrintRaw(L"");
-            PrintRaw(L"Номер страны из списка выше (пусто - снять домашний регион): ");
-            std::wstring country;
-            std::getline(std::wcin, country);
-            if (country.empty()) {
-                CmdSetHomeRegion(L"", L"");
-            } else {
-                std::wstring slug = ResolveCountryInput(country);
-                if (slug.empty() || !SlugToIso(slug).has_value()) {
-                    PrintRaw(L"Неверный номер страны.");
-                } else {
-                    CmdListCities(slug);
-                    PrintRaw(L"");
-                    PrintRaw(L"Номер города (Enter - любой город страны): ");
-                    std::wstring city;
-                    std::getline(std::wcin, city);
-                    CmdSetHomeRegion(slug, city);
-                }
-            }
-        } else if (choice == L"8") {
-            CmdListDevices();
-        } else if (choice == L"9") {
-            PrintRaw(L"Имя устройства (например, ThinkPad): ");
-            std::wstring name;
-            std::getline(std::wcin, name);
-            PrintRaw(L"Адрес устройства (IP или Yggdrasil-адрес): ");
-            std::wstring host;
-            std::getline(std::wcin, host);
-            CmdAddDevice(name, host);
-        } else if (choice == L"10") {
-            CmdListDevices();
-            PrintRaw(L"");
-            PrintRaw(L"Имя устройства для удаления: ");
-            std::wstring name;
-            std::getline(std::wcin, name);
-            CmdRemoveDevice(name);
-        } else if (choice == L"11") {
-            PrintRaw(L"Полный путь к скрипту: ");
-            std::wstring path;
-            std::getline(std::wcin, path);
-            ApproveVpnCommand(path);
-        } else if (choice == L"12") {
-            ClearVpnApproval();
-        } else if (choice == L"13") {
-            auto info = CheckForUpdate();
-            if (!info.has_value()) {
-                PrintRaw(L"Новых версий не найдено (текущая: " + CURRENT_VERSION + L").");
-            } else {
-                PrintRaw(L"Доступна новая версия: " + info->tag + L". " + info->url);
-            }
-        } else if (choice == L"14") {
-            ApplyUpdate();
-        } else if (choice == L"0") {
-            break;
-        } else {
-            PrintRaw(L"Неизвестный пункт меню.");
-        }
-
-        WaitForEnter();
-    }
-    return 0;
-}
 
 // ------------------------------------------------------------------
 // main
@@ -2930,30 +3614,9 @@ bool IsElevated() {
     return isAdmin;
 }
 
-// Перезапускает себя же с правами администратора через UAC, передавая
-// дальше те же аргументы командной строки (argv[1], argv[2], ...).
-void RelaunchElevated(int argc, wchar_t* argv[]) {
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-
-    std::wstring args;
-    for (int i = 1; i < argc; ++i) {
-        if (i > 1) args += L" ";
-        args += L"\"" + std::wstring(argv[i]) + L"\"";
-    }
-
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
-    sei.lpFile = exePath;
-    sei.lpParameters = args.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-
-    if (!ShellExecuteExW(&sei)) {
-        LogError(L"Не удалось получить права администратора (пользователь отменил UAC?)");
-    }
-}
-
-int wmain(int argc, wchar_t* argv[]) {
+// Консольные команды (tick, install-task, status-json и т.д.). Окно -
+// в gui/ygg_watchdog_gui.cpp, точка входа wWinMain - в конце файла.
+int WatchdogMain(int argc, wchar_t* argv[]) {
     std::vector<std::wstring> args;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -2964,23 +3627,20 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // Права администратора нужны и для самого планировщика, и для
-    // интерактивного меню (там тоже есть install-task/uninstall-task) -
-    // поэтому проверяем/поднимаем права ДО проверки на пустые аргументы.
-    // Раньше это было наоборот: при запуске без аргументов (двойной клик
-    // по exe без .bat-обёртки) программа просто печатала подсказку и
-    // сразу завершалась, из-за чего казалось, что exe "не открывается".
-    if (!IsElevated()) {
-        LogInfo(L"Требуются права администратора, перезапуск с повышением прав...");
-        RelaunchElevated(argc, argv); // передаём оригинальные argv, включая -v, если был
-        return 0;
+    // Права администратора нужны для планировщика, службы и конфига.
+    // status-json и справочники только читают - им права не нужны.
+    // Окно и задача Планировщика и так работают с правами; из обычной
+    // консоли перезапуск с UAC увёл бы вывод в никуда (exe оконный), поэтому
+    // просто говорим, что нужна консоль администратора.
+    bool readOnlyCommand = !args.empty() &&
+        (args[0] == L"status-json" || args[0] == L"countries-json" || args[0] == L"cities-json" ||
+         args[0] == L"diagnose" || args[0] == L"catalog-json");
+    if (!readOnlyCommand && !IsElevated()) {
+        PrintError(L"нужны права администратора: запусти команду из консоли «от имени администратора».");
+        return 1;
     }
 
-    if (args.empty()) {
-        // Запуск без аргументов (двойной клик) - показываем меню вместо
-        // мгновенного закрытия окна.
-        return RunInteractiveMenu();
-    }
+    if (args.empty()) return 0;
 
     std::wstring command = args[0];
 
@@ -3034,6 +3694,22 @@ int wmain(int argc, wchar_t* argv[]) {
             try { delay = std::stoi(args[1]); } catch (...) {}
         }
         RestartYggdrasilServiceDelayed(delay);
+    } else if (command == L"status-json") {
+        CmdStatusJson();
+    } else if (command == L"diagnose") {
+        std::vector<std::wstring> mp;
+        auto cfgPath = FindConfigPath();
+        if (cfgPath.has_value()) mp = ReadMainPeers(*cfgPath);
+        Print(DiagnoseNowText(mp));
+    } else if (command == L"countries-json") {
+        CmdCountriesJson();
+    } else if (command == L"verify-peer") {
+        if (args.size() < 2) { LogError(L"Использование: verify-peer <uri>"); return 1; }
+        CmdVerifyPeer(args[1]);
+    } else if (command == L"catalog-json") {
+        CmdCatalogJson(args.size() >= 2 ? args[1] : L"");
+    } else if (command == L"cities-json") {
+        CmdCitiesJson(args.size() >= 2 ? args[1] : L"");
     } else if (command == L"set-home-region") {
         CmdSetHomeRegion(args.size() >= 2 ? args[1] : L"", args.size() >= 3 ? args[2] : L"");
     } else if (command == L"list-devices") {
@@ -3061,16 +3737,92 @@ int wmain(int argc, wchar_t* argv[]) {
     } else if (command == L"check-update") {
         auto info = CheckForUpdate();
         if (!info.has_value()) {
-            LogInfo(L"Новых версий не найдено (текущая: " + CURRENT_VERSION + L").");
+            Print(L"Новых версий не найдено (текущая: " + CURRENT_VERSION + L").");
         } else {
-            LogInfo(L"Доступна новая версия: " + info->tag + L". " + info->url);
+            Print(L"Доступна новая версия: " + info->tag + L". " + info->url);
         }
     } else if (command == L"apply-update") {
         ApplyUpdate();
+    } else if (command == L"test-notify") {
+        // Для кнопки «Проверить» в окне: notify.conf пишет само окно,
+        // токен через командную строку не передаётся.
+        NotifyConfig config = LoadNotifyConfig();
+        if (!config.valid) {
+            PrintError(L"Telegram не настроен: в notify.conf нет BOT_TOKEN или CHAT_ID.");
+            return 1;
+        }
+        if (SendTelegramNotification(L"Проверка связи: уведомления ygg-watchdog работают.")) {
+            Print(L"Тестовое сообщение отправлено в Telegram.");
+        } else {
+            PrintError(L"Не удалось отправить в Telegram. Проверь токен и chat id; если Telegram "
+                       L"не открывается без VPN - нужен VPN или строка PROXY в notify.conf.");
+            return 1;
+        }
     } else {
         LogError(L"Неизвестная команда: " + command);
         return 1;
     }
 
     return 0;
+}
+
+// ------------------------------------------------------------------
+// Точка входа. Программа одна: без параметров открывается окно, с
+// параметром выполняется команда (так её зовут задача Планировщика и само
+// окно). Exe собран как оконный (-mwindows), поэтому проверки по таймеру
+// не мелькают консолью. Если команду запустили из cmd - пишем в него.
+// ------------------------------------------------------------------
+namespace gui { int Run(HINSTANCE hInst, int nCmdShow); namespace tray { int Run(HINSTANCE hInst); } }
+
+static void UseParentConsoleIfNoOutput() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return; // pipe или файл - уже есть
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;                                // запущено не из консоли
+    HANDLE con = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, 0, nullptr);
+    if (con == INVALID_HANDLE_VALUE) return;
+    SetStdHandle(STD_OUTPUT_HANDLE, con);
+    SetStdHandle(STD_ERROR_HANDLE, con);
+    WriteOut(L"\r\n");
+}
+
+// Оставляем свой путь в реестре (HKLM\SOFTWARE\Yozmor\ygg-watchdog), чтобы
+// панель ygg-control находила сторожа, где бы он ни лежал. Без прав
+// администратора записать нельзя - тогда молча пропускаем.
+static void RegisterSelfInRegistry() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Yozmor\\ygg-watchdog", 0, nullptr, 0, KEY_SET_VALUE | KEY_QUERY_VALUE,
+                        nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    wchar_t cur[MAX_PATH * 2] = L"";
+    DWORD size = sizeof(cur);
+    if (RegQueryValueExW(k, L"Path", nullptr, nullptr, (BYTE*)cur, &size) != ERROR_SUCCESS || _wcsicmp(cur, exe) != 0)
+        RegSetValueExW(k, L"Path", 0, REG_SZ, (const BYTE*)exe, (DWORD)((wcslen(exe) + 1) * sizeof(wchar_t)));
+    RegSetValueExW(k, L"Version", 0, REG_SZ, (const BYTE*)CURRENT_VERSION.c_str(), (DWORD)((CURRENT_VERSION.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+}
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
+    RegisterSelfInRegistry();
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 1;
+    bool hasCommand = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a != L"-v" && a != L"--verbose") hasCommand = true;
+    }
+    int rc;
+    if (argc >= 2 && std::wstring(argv[1]) == L"tray") {
+        // значок в трее: без прав администратора, без консоли
+        rc = gui::tray::Run(hInst);
+    } else if (!hasCommand) {
+        rc = gui::Run(hInst, nCmdShow);
+    } else {
+        UseParentConsoleIfNoOutput();
+        rc = WatchdogMain(argc, argv);
+    }
+    LocalFree(argv);
+    return rc;
 }
