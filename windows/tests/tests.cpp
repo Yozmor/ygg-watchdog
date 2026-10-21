@@ -29,6 +29,15 @@ static void TestUris() {
     Eq(HostFromUri(L"мусор"), L"", L"не адрес");
     util::PeerUri u = util::ParseUri(L"wss://ygg.example.com:443/ws?key=1");
     Check(u.ok && u.scheme == L"wss" && u.host == L"ygg.example.com" && u.port == L"443" && u.query == L"key=1", L"ParseUri wss с путём");
+    {
+        in6_addr a;
+        InetPtonW(AF_INET6, L"201:831c:922f:195a:45e9:bc59:ccc8:b93a", &a);
+        Check(IsYggAddress(a), L"201:… - адрес Yggdrasil");
+        InetPtonW(AF_INET6, L"300:1::1", &a);
+        Check(IsYggAddress(a), L"300:… (подсеть) - адрес Yggdrasil");
+        InetPtonW(AF_INET6, L"2001:db8::1", &a);
+        Check(!IsYggAddress(a), L"2001:db8::1 - не Yggdrasil");
+    }
     Eq(NormalizeIpv6(L"201-831c-922f-195a-45e9-bc59-ccc8-b93a.ipv6-literal.net"), L"201:831c:922f:195a:45e9:bc59:ccc8:b93a",
        L"адрес вида ipv6-literal.net");
 }
@@ -119,6 +128,9 @@ static void TestState() {
     PeerTrack t; t.up = true; t.uptime = 50; t.at = now; t.flaps = { now - 10, now - 5 };
     s.peerTracks[L"tls://a:1"] = t;
     s.configError = L"строка 3: лишняя }";
+    s.devicePeers[L"Kjele"] = { L"tls://ygg-msk-1.averyan.ru:8362", L"tls://[2001:db8::2]:443" };
+    s.deviceTempPeers[L"Kjele"] = { L"tls://ygg-msk-1.averyan.ru:8362" };
+    s.deviceWhy[L"Kjele"] = L"сеть не находит путь";
     SaveState(s);
     WatchdogState l = LoadState();
     Check(l.backupPeers == s.backupPeers, L"резервные пиры (IPv6, ?key=)");
@@ -127,6 +139,8 @@ static void TestState() {
     Check(l.outageNotified && l.failedCandidates.count(L"tls://bad:1"), L"флаги и неудачные кандидаты");
     Check(l.peerTracks.count(L"tls://a:1") && l.peerTracks[L"tls://a:1"].flaps.size() == 2, L"история обрывов");
     Eq(l.configError, s.configError, L"текст ошибки конфига");
+    Check(l.devicePeers[L"Kjele"] == s.devicePeers[L"Kjele"] && l.deviceTempPeers[L"Kjele"].size() == 1 &&
+          l.deviceWhy[L"Kjele"] == s.deviceWhy[L"Kjele"], L"общие и временные пиры устройства, причина");
 
     // старый формат: регион-режим и региональные пиры -> обычные резервные
     util::WriteFileAtomic(StatePath(), "mode=regional\r\nregional_peers=tls://x:1;tls://y:2\r\nbackup_peers=tls://x:1\r\n");
@@ -191,6 +205,18 @@ static void TestExeAndTask() {
     Eq(GitBlobSha1Hex("hello\n"), L"ce013625030ba8dba906f756967f9e9ca394464a", L"git-отпечаток файла");
 }
 
+static void TestRoutes() {
+    Section(L"маршруты до Telegram / GitHub");
+    HttpRoute r{ L"proxy", L"127.0.0.1:3067", L"Karing (127.0.0.1:3067)" }, back;
+    Check(RouteFromText(RouteToText(r), back) && back.kind == r.kind && back.proxy == r.proxy && back.label == r.label,
+          L"запомненный маршрут читается обратно");
+    Check(RouteFromText(L"direct||напрямую", back) && back.kind == L"direct", L"маршрут «напрямую»");
+    Check(!RouteFromText(L"proxy||без адреса", back), L"прокси без адреса - не маршрут");
+    Check(!RouteFromText(L"мусор", back), L"мусор - не маршрут");
+    auto names = ProxyClientNames();
+    Check(std::find(names.begin(), names.end(), L"karing") != names.end(), L"Karing во встроенном списке клиентов");
+}
+
 static void TestJson() {
     Section(L"json_lite");
     json::Value v;
@@ -214,6 +240,7 @@ int wmain() {
     TestHistory();
     TestExeAndTask();
     TestJson();
+    TestRoutes();
     WriteOut(L"\r\nПройдено: " + std::to_wstring(g_pass) + L", провалено: " + std::to_wstring(g_fail) + L"\r\n");
     return g_fail == 0 ? 0 : 1;
 }

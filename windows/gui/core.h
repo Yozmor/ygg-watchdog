@@ -214,10 +214,10 @@ inline TaskInfo QueryTask(const wchar_t* name) {
                                     ti.exe = buf;
                                     if (ti.exe.size() >= 2 && ti.exe.front() == L'"') ti.exe = ti.exe.substr(1, ti.exe.size() - 2);
                                     SysFreeString(path);
-                                    if (SUCCEEDED(ex->get_Arguments(&args)) && args) {
-                                        ti.exe = TaskTargetExe(ti.exe, args);
-                                        SysFreeString(args);
-                                    }
+                                    // страж запускается без аргументов - сопоставляем всегда
+                                    std::wstring a;
+                                    if (SUCCEEDED(ex->get_Arguments(&args)) && args) { a = args; SysFreeString(args); }
+                                    ti.exe = TaskTargetExe(ti.exe, a);
                                 }
                                 ex->Release();
                             }
@@ -264,8 +264,7 @@ inline std::wstring FindWatchdogExe(const TaskInfo& ti) {
     if (a == std::wstring::npos || b == std::wstring::npos || b <= a) return L"";
     std::wstring exe = xml.substr(a + 9, b - a - 9);
     if (exe.size() >= 2 && exe.front() == L'"') exe = exe.substr(1, exe.size() - 2);
-    size_t aa = xml.find(L"<Arguments>"), ab = xml.find(L"</Arguments>");
-    if (aa != std::wstring::npos && ab != std::wstring::npos && ab > aa) exe = TaskTargetExe(exe, xml.substr(aa + 11, ab - aa - 11));
+    exe = TaskTargetExe(exe, L"");
     return util::FileExists(exe) ? exe : L"";
 }
 

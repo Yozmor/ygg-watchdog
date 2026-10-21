@@ -220,10 +220,10 @@ TaskInfo QueryTask(const wchar_t* name) {
                                     if (ti.exe.size() >= 2 && ti.exe.front() == L'"') ti.exe = ti.exe.substr(1, ti.exe.size() - 2);
                                     SysFreeString(path);
                                     // задача через стража (ygg_guard.exe) -> стережёт ygg_watchdog.exe рядом
-                                    if (SUCCEEDED(ex->get_Arguments(&args)) && args) {
-                                        ti.exe = ygg::TaskTargetExe(ti.exe, args);
-                                        SysFreeString(args);
-                                    }
+                                    // страж запускается без аргументов - сопоставляем всегда
+                                    std::wstring a;
+                                    if (SUCCEEDED(ex->get_Arguments(&args)) && args) { a = args; SysFreeString(args); }
+                                    ti.exe = ygg::TaskTargetExe(ti.exe, a);
                                 }
                                 ex->Release();
                             }
@@ -382,9 +382,7 @@ private:
             if (a != std::wstring::npos && b != std::wstring::npos && b > a) {
                 s.taskExe = xml.substr(a + 9, b - a - 9);
                 if (s.taskExe.size() >= 2 && s.taskExe.front() == L'"') s.taskExe = s.taskExe.substr(1, s.taskExe.size() - 2);
-                size_t aa = xml.find(L"<Arguments>"), ab = xml.find(L"</Arguments>");
-                if (aa != std::wstring::npos && ab != std::wstring::npos && ab > aa)
-                    s.taskExe = ygg::TaskTargetExe(s.taskExe, xml.substr(aa + 11, ab - aa - 11));
+                s.taskExe = ygg::TaskTargetExe(s.taskExe, L"");
             }
         }
 
@@ -422,7 +420,7 @@ enum {
     NAV_FIRST = 10,                       // NAV_FIRST + Screen
     BTN_ADD_PEER = 20, BTN_DEL_PEER, BTN_RESTART_NOW, BTN_RESTART_LATER,
     BTN_REGION_ON = 30, BTN_REGION_OFF, BTN_HOME_SET, BTN_HOME_CLEAR,
-    BTN_DEV_ADD = 40, BTN_DEV_DEL,
+    BTN_DEV_ADD = 40, BTN_DEV_DEL, BTN_DEV_DIAG,
     BTN_TASK_INSTALL = 50, BTN_TASK_REMOVE, BTN_UPD_CHECK, BTN_UPD_APPLY, BTN_VPN_PICK, BTN_VPN_CLEAR, BTN_ANIM,
     BTN_TG_SAVE, BTN_TG_TEST,
     BTN_HEADER_TASK = 60,
@@ -435,7 +433,7 @@ enum {
 };
 
 // Команды, чей результат надо особо обработать
-enum { CMD_GENERIC = 0, CMD_ADD_PEER, CMD_ADD_DEVICE, CMD_TICK, CMD_REGION, CMD_VERIFY };
+enum { CMD_GENERIC = 0, CMD_ADD_PEER, CMD_ADD_DEVICE, CMD_TICK, CMD_REGION, CMD_VERIFY, CMD_DIAG };
 
 std::wstring Quote(const std::wstring& s) { return L"\"" + s + L"\""; }
 
@@ -514,7 +512,9 @@ struct App {
     std::function<void()> confirmAction;
 
     // виджеты
-    TextBox tbPeer, tbCity, tbDevName, tbDevHost, tbTgToken, tbTgChat;
+    TextBox tbPeer, tbCity, tbDevName, tbDevHost, tbDevPeers, tbTgToken, tbTgChat;
+    std::map<std::wstring, std::wstring> devDiag;   // итог кнопки «Диагностика» по имени устройства
+    std::wstring devDiagFor;                         // для какого устройства сейчас идёт разбор
     ListBox lbMain, lbLive, lbCountries, lbCities, lbDevices, lbLog, lbCatCountries, lbCatCities, lbCatalog, lbStats;
 
     // статистика (stats-json): грузится при входе на экран и раз в минуту, пока он открыт
@@ -554,6 +554,7 @@ struct App {
         tbCity.id = 101; tbCity.placeholder = L"поиск города…";
         tbDevName.id = 102;
         tbDevHost.id = 103;
+        tbDevPeers.id = 106; tbDevPeers.placeholder = L"tls://host:port …";
         tbTgToken.id = 104; tbTgToken.password = true;
         tbTgChat.id = 105;
         lbMain.id = 200; lbMain.emptyText = L"в конфиге нет пиров";
@@ -1038,7 +1039,7 @@ struct App {
     void Redraw() { InvalidateRect(hwnd, nullptr, FALSE); }
 
     void SetTb(TextBox* tb) {
-        for (TextBox* t : { &tbPeer, &tbCity, &tbDevName, &tbDevHost, &tbTgToken, &tbTgChat }) t->focus = (t == tb);
+        for (TextBox* t : { &tbPeer, &tbCity, &tbDevName, &tbDevHost, &tbDevPeers, &tbTgToken, &tbTgChat }) t->focus = (t == tb);
         focusTb = tb;
         if (tb) { focusLb = nullptr; focusBtn = 0; }
     }
@@ -1574,8 +1575,28 @@ struct App {
     }
 
     // ================== УСТРОЙСТВА ==================
+    const json::Value* DeviceJson(const std::wstring& name) const {
+        const auto& devs = snap.status[L"devices"];
+        for (size_t i = 0; i < devs.size(); ++i) if (devs[i][L"name"].str() == name) return &devs[i];
+        return nullptr;
+    }
+    static std::wstring JoinArr(const json::Value& a) {
+        std::wstring s;
+        for (size_t i = 0; i < a.size(); ++i) { if (i) s += L" "; s += a[i].str(); }
+        return s;
+    }
+    // Выбрал устройство в списке - его данные в поля справа (поправить и сохранить)
+    void FillDeviceFields() {
+        const ListItem* s = lbDevices.Selected();
+        const json::Value* d = s ? DeviceJson(s->key) : nullptr;
+        if (!d) return;
+        tbDevName.Set((*d)[L"name"].str());
+        tbDevHost.Set((*d)[L"host"].str());
+        tbDevPeers.Set(JoinArr((*d)[L"peers"]));
+    }
+
     void DrawDevicesScreen(const Theme& th) {
-        r.Panel(24, 86, 620, 504, th, L"УСТРОЙСТВА  //  пинг после подтверждённой связи с пирами");
+        r.Panel(24, 86, 620, 504, th, L"УСТРОЙСТВА  //  проверка после подтверждённой связи с пирами");
         std::vector<ListItem> items;
         const auto& devs = snap.status[L"devices"];
         for (size_t i = 0; i < devs.size(); ++i) {
@@ -1588,20 +1609,46 @@ struct App {
             items.push_back(it);
         }
         lbDevices.SetItems(items);
-        List(lbDevices, th, 40, 124, 588, 300);
-        Btn(BTN_DEV_DEL, 40, 436, 260, 32, L"УДАЛИТЬ ВЫБРАННОЕ", COL_ALERT, false, lbDevices.Selected() != nullptr);
-        Note(th, 40, 484, 588, L"Если устройство не отвечает, сторож проверяет, не мешает ли нагрузка самому Yggdrasil "
-                              L"на этом компьютере, и если мешает - перезапускает свою службу. Повтор - не чаще раза в час. "
-                              L"Телефон не мониторится.");
+        List(lbDevices, th, 40, 124, 588, 230);
+        const ListItem* sel = lbDevices.Selected();
+        Btn(BTN_DEV_DEL, 40, 366, 220, 32, L"УДАЛИТЬ", COL_ALERT, false, sel != nullptr);
+        Btn(BTN_DEV_DIAG, 272, 366, 356, 32, devDiagFor.empty() ? L"ДИАГНОСТИКА - ПОЧЕМУ НЕДОСТУПНО" : L"РАЗБИРАЮСЬ…",
+            th.accent, false, sel != nullptr && devDiagFor.empty());
 
-        r.Panel(660, 86, 356, 504, th, L"ДОБАВИТЬ");
+        // подробности выбранного устройства: причина, общие пиры, временные пиры
+        float y = 412;
+        if (sel) {
+            const json::Value* d = DeviceJson(sel->key);
+            auto dg = devDiag.find(sel->key);
+            std::wstring why = d ? (*d)[L"why"].str() : L"";
+            if (dg != devDiag.end()) {
+                Caption(th, 40, y, 588, L"ДИАГНОСТИКА СЕЙЧАС"); y += 20;
+                y += r.TextWrapped(dg->second, 40, y, 588, Rgb(th.text), 12) + 8;
+            } else if (d && (*d)[L"down_since"].i64() && !why.empty()) {
+                Caption(th, 40, y, 588, L"ПОЧЕМУ НЕДОСТУПНО (последняя проверка)"); y += 20;
+                y += r.TextWrapped(why, 40, y, 588, Rgb(COL_ALERT), 12) + 8;
+            }
+            std::wstring peers = d ? JoinArr((*d)[L"peers"]) : L"", temp = d ? JoinArr((*d)[L"temp_peers"]) : L"";
+            if (!peers.empty()) { y += r.TextWrapped(L"общие пиры: " + peers, 40, y, 588, Rgb(th.muted), 11) + 4; }
+            if (!temp.empty()) { y += r.TextWrapped(L"сейчас подключены временно: " + temp, 40, y, 588, Rgb(COL_WARN), 11) + 4; }
+        }
+        if (y < 520)
+            Note(th, 40, 528, 588, L"Если устройство не отвечает, сторож разбирает почему (этот компьютер, маршрут, сеть, само устройство) "
+                                  L"и пробует то, что можно сделать отсюда. Повтор мер - не чаще раза в час. Телефон не мониторится.");
+
+        r.Panel(660, 86, 356, 504, th, L"ДОБАВИТЬ / ИЗМЕНИТЬ");
         Caption(th, 676, 124, 324, L"имя");
         Field(tbDevName, th, 676, 144, 324);
-        Caption(th, 676, 188, 324, L"адрес Yggdrasil или IP");
-        Field(tbDevHost, th, 676, 208, 324);
-        Btn(BTN_DEV_ADD, 676, 256, 324, 36, L"ДОБАВИТЬ", th.accent, true,
+        Caption(th, 676, 186, 324, L"адрес Yggdrasil или IP");
+        Field(tbDevHost, th, 676, 206, 324);
+        Caption(th, 676, 248, 324, L"общие пиры (необязательно, через пробел)");
+        Field(tbDevPeers, th, 676, 268, 324);
+        Btn(BTN_DEV_ADD, 676, 316, 324, 36, L"СОХРАНИТЬ", th.accent, true,
             !tbDevName.Trimmed().empty() && !tbDevHost.Trimmed().empty());
-        Note(th, 676, 304, 324, L"Если устройство с таким именем уже есть - у него просто обновится адрес.");
+        Note(th, 676, 364, 324, L"Устройство с таким именем уже есть - обновятся адрес и пиры. Выбери устройство в списке - "
+                                L"его данные встанут в поля.");
+        Note(th, 676, 430, 324, L"Общие пиры - те, к которым подключено и само устройство (для Kjele - его пиры из конфига). "
+                                L"Если сеть не находит путь до устройства, сторож подключит их на время и уберёт, когда оно вернётся.");
     }
 
     // ================== ЖУРНАЛ ==================
@@ -1723,7 +1770,19 @@ struct App {
         // Telegram: значения только вводятся, обратно не показываются
         y = 442;
         bool tg = st[L"telegram_configured"].boolean();
-        line(544, y, 456, L"Telegram", tg ? L"настроен" : L"не настроен", tg ? COL_OK : th.muted);
+        {
+            // последняя отправка: как ушла или почему не ушла (подробно - кнопка «Проверить»)
+            const auto& tl = st[L"telegram_last"];
+            std::wstring v = tg ? L"настроен" : L"не настроен";
+            unsigned c = tg ? COL_OK : th.muted;
+            if (tg && tl[L"at"].i64() > 0) {
+                if (tl[L"ok"].boolean()) v = HhMm(tl[L"at"].i64()) + L" ушло: " + tl[L"via"].str();
+                else { v = HhMm(tl[L"at"].i64()) + L" НЕ ушло: " + tl[L"err"].str(); c = COL_ALERT; }
+            }
+            r.Text(L"Telegram", 544, y, 100, 20, Rgb(th.muted), 12);
+            r.Text(v, 630, y, 370, 20, Rgb(c), 11, false, Right);   // длинное обрезается рамкой
+            y += 24;
+        }
         Caption(th, 544, 466, 220, tg ? L"новый токен бота" : L"токен бота");
         Caption(th, 780, 466, 220, tg ? L"новый chat id" : L"chat id");
         Field(tbTgToken, th, 544, 484, 220, 30);
@@ -1777,7 +1836,14 @@ struct App {
         if (tag == CMD_TICK) { checkRequestedAt = 0; last = L"Проверка выполнена."; }
         else if (!failed && !okMessage.empty()) last = okMessage;
         if (!failed && tag == CMD_ADD_PEER) tbPeer.Set(L"");
-        if (!failed && tag == CMD_ADD_DEVICE) { tbDevName.Set(L""); tbDevHost.Set(L""); }
+        if (!failed && tag == CMD_ADD_DEVICE) { tbDevName.Set(L""); tbDevHost.Set(L""); tbDevPeers.Set(L""); }
+        if (tag == CMD_DIAG) {
+            std::wstring all;
+            for (auto& l : lines) { if (!all.empty()) all += L"\n"; all += l; }
+            if (!devDiagFor.empty()) devDiag[devDiagFor] = all.empty() ? L"сторож ничего не ответил" : all;
+            devDiagFor.clear();
+            last = L"Диагностика готова - результат под списком устройств.";
+        }
         if (!failed && tag == CMD_REGION) ClearRegionPick();
         if (tag == CMD_VERIFY) {
             // итог - JSON в последней строке вывода
@@ -1948,9 +2014,25 @@ struct App {
         }
         case BTN_HOME_CLEAR: RunCmd(L"снимаю домашний регион", L"set-home-region clear", CMD_GENERIC, 120000, L"Домашний регион снят."); break;
 
-        case BTN_DEV_ADD:
-            RunCmd(L"добавляю устройство", L"add-device " + Quote(tbDevName.Trimmed()) + L" " + Quote(tbDevHost.Trimmed()), CMD_ADD_DEVICE);
+        case BTN_DEV_ADD: {
+            std::wstring peers = tbDevPeers.Trimmed();
+            if (!peers.empty()) {
+                std::wstringstream ps(peers);
+                std::wstring one;
+                while (ps >> one) if (one.find(L"://") == std::wstring::npos) { Flash(L"Пир должен быть вида tls://host:port: " + one, COL_ALERT); return; }
+            }
+            RunCmd(L"сохраняю устройство", L"add-device " + Quote(tbDevName.Trimmed()) + L" " + Quote(tbDevHost.Trimmed()) + L" " +
+                   (peers.empty() ? std::wstring(L"--no-peers") : Quote(peers)), CMD_ADD_DEVICE, 120000, L"Устройство сохранено.");
             break;
+        }
+        case BTN_DEV_DIAG: {
+            const ListItem* s = lbDevices.Selected();
+            if (!s) break;
+            devDiagFor = s->key;
+            devDiag.erase(s->key);
+            RunCmd(L"разбираюсь с " + s->key, L"diagnose-device " + Quote(s->key), CMD_DIAG, 120000);
+            break;
+        }
         case BTN_DEV_DEL: {
             const ListItem* s = lbDevices.Selected();
             if (!s) break;
@@ -2110,7 +2192,7 @@ struct App {
     std::vector<TextBox*> ScreenFields() {
         if (screen == SCR_PEERS) return { &tbPeer };
         if (screen == SCR_REGION) return { &tbCity };
-        if (screen == SCR_DEVICES) return { &tbDevName, &tbDevHost };
+        if (screen == SCR_DEVICES) return { &tbDevName, &tbDevHost, &tbDevPeers };
         if (screen == SCR_CONTROL) return { &tbTgToken, &tbTgChat };
         return {};
     }
@@ -2143,6 +2225,7 @@ struct App {
                 if (l == &lbCountries) OnCountryPicked();
                 if (l == &lbCatCountries) OnCatCountryPicked();
                 if (l == &lbCatCities) { lbCatalog.sel = -1; lbCatalog.scroll = 0; }
+                if (l == &lbDevices) FillDeviceFields();
                 return;
             }
         }
@@ -2172,7 +2255,8 @@ struct App {
     void SubmitField(TextBox* t) {
         if (t == &tbPeer && !tbPeer.Trimmed().empty()) OnButton(BTN_ADD_PEER);
         else if (t == &tbDevName) SetTb(&tbDevHost);
-        else if (t == &tbDevHost && !tbDevName.Trimmed().empty() && !tbDevHost.Trimmed().empty()) OnButton(BTN_DEV_ADD);
+        else if (t == &tbDevHost) SetTb(&tbDevPeers);
+        else if (t == &tbDevPeers && !tbDevName.Trimmed().empty() && !tbDevHost.Trimmed().empty()) OnButton(BTN_DEV_ADD);
         else if (t == &tbTgToken) SetTb(&tbTgChat);
         else if (t == &tbTgChat && (!tbTgToken.Trimmed().empty() || !tbTgChat.Trimmed().empty())) OnButton(BTN_TG_SAVE);
     }
@@ -2205,6 +2289,7 @@ struct App {
             if (focusLb == &lbCountries) OnCountryPicked();
             if (focusLb == &lbCatCountries) OnCatCountryPicked();
             if (focusLb == &lbCatCities) { lbCatalog.sel = -1; lbCatalog.scroll = 0; }
+            if (focusLb == &lbDevices) FillDeviceFields();
             Redraw();
             return;
         }

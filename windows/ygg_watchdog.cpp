@@ -547,6 +547,7 @@ struct NotifyConfig {
                                  // планировщика, которая работает от
                                  // имени SYSTEM и не видит HKCU обычного
                                  // пользователя)
+    std::wstring proxyClients;  // PROXY_CLIENTS - свои VPN-клиенты для автопоиска (части имени exe через запятую)
     bool valid = false; // именно для Telegram - нужны оба BOT_TOKEN/CHAT_ID
 };
 
@@ -564,103 +565,288 @@ NotifyConfig LoadNotifyConfig() {
         std::wstring value = line.substr(eq + 1);
         if (key == L"BOT_TOKEN") config.botToken = value;
         else if (key == L"CHAT_ID") config.chatId = value;
-        else if (key == L"PROXY") config.proxyOverride = value;
+        else if (key == L"PROXY") config.proxyOverride = util::Trim(value);
+        else if (key == L"PROXY_CLIENTS") config.proxyClients = value;
     }
     config.valid = !config.botToken.empty() && !config.chatId.empty();
     return config;
 }
 
 
-HINTERNET OpenHttpSessionWithProxy() {
-    // Сначала - явный PROXY из notify.conf, если прописан. Это нужно
-    // для задачи планировщика (работает от имени SYSTEM и не видит
-    // системную настройку прокси текущего пользователя из HKCU -
-    // у SYSTEM она своя, отдельная и обычно пустая).
-    NotifyConfig notifyConfig = LoadNotifyConfig();
-    if (!notifyConfig.proxyOverride.empty()) {
-        HINTERNET hSession = WinHttpOpen(L"ygg-watchdog/1.0",
-            WINHTTP_ACCESS_TYPE_NAMED_PROXY, notifyConfig.proxyOverride.c_str(),
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (hSession) return hSession;
-        LogDebug(L"Явный PROXY из notify.conf не удалось использовать, "
-                 L"пробую системную настройку текущего пользователя");
-    }
+// ------------------------------------------------------------------
+// Как достучаться до сайта (Telegram, GitHub): маршруты по очереди, пока
+// какой-то не сработает.
+//   1. тот, что сработал в прошлый раз для этого сайта (запомнен в реестре);
+//   2. PROXY= из notify.conf;
+//   3. подсказка от VPN-клиента: значение LocalProxy в HKLM\SOFTWARE\Yozmor
+//      или первая строка файла %ProgramData%\Yozmor\local_proxy.txt
+//      (например "127.0.0.1:2080") - так свой клиент может сообщить порт;
+//   4. напрямую (работает, когда VPN-клиент в TUN-режиме);
+//   5. системный прокси пользователя (есть у окна и трея, у SYSTEM - нет);
+//   6. автопоиск: какие известные VPN-клиенты слушают порты на 127.0.0.1,
+//      каждый порт проверяется запросом CONNECT к нужному сайту.
+// Сработавший маршрут запоминается. WinHTTP умеет только HTTP-прокси
+// (с CONNECT) - чистый SOCKS-порт не подойдёт.
+// ------------------------------------------------------------------
+static const wchar_t* REG_YOZMOR = L"SOFTWARE\\Yozmor";
+static const wchar_t* REG_WATCHDOG_KEY = L"SOFTWARE\\Yozmor\\ygg-watchdog";
 
-    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxyConfig = {};
-    HINTERNET hSession = nullptr;
+struct HttpRoute {
+    std::wstring kind;    // direct / ie / proxy
+    std::wstring proxy;   // "127.0.0.1:2080" для proxy
+    std::wstring label;   // для людей: "напрямую", "Karing (127.0.0.1:3067)"
+};
 
-    if (WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig) && ieProxyConfig.lpszProxy) {
-        hSession = WinHttpOpen(L"ygg-watchdog/1.0",
-            WINHTTP_ACCESS_TYPE_NAMED_PROXY, ieProxyConfig.lpszProxy,
-            ieProxyConfig.lpszProxyBypass ? ieProxyConfig.lpszProxyBypass : WINHTTP_NO_PROXY_BYPASS, 0);
+struct HttpResult {
+    bool transportOk = false;   // сервер ответил (любым HTTP-кодом)
+    DWORD status = 0;
+    DWORD winErr = 0;           // код WinHTTP, если не дошли
+    std::string body;
+    bool readOk = true;         // тело дочитано без обрыва
+    bool haveLen = false;
+    unsigned long long expectedLen = 0, gotLen = 0;
+    std::wstring via;           // каким маршрутом
+};
+
+using BodySink = std::function<bool(const char*, DWORD)>;
+
+HttpResult HttpOnce(const HttpRoute& rt, const wchar_t* method, const std::wstring& host, const std::wstring& path,
+                    const std::wstring& headers, const std::string* body, const BodySink& sink, DWORD recvTimeoutMs,
+                    size_t maxBody = 64 * 1024 * 1024) {
+    HttpResult r;
+    r.via = rt.label;
+    HINTERNET s = nullptr;
+    const wchar_t* ua = L"ygg-watchdog/1.0";
+    if (rt.kind == L"proxy") {
+        s = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NAMED_PROXY, rt.proxy.c_str(), WINHTTP_NO_PROXY_BYPASS, 0);
+    } else if (rt.kind == L"ie") {
+        WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ie = {};
+        if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
+            if (ie.lpszProxy) s = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NAMED_PROXY, ie.lpszProxy,
+                                              ie.lpszProxyBypass ? ie.lpszProxyBypass : WINHTTP_NO_PROXY_BYPASS, 0);
+            else if (ie.lpszAutoConfigUrl || ie.fAutoDetect) s = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl);
+            if (ie.lpszProxy) GlobalFree(ie.lpszProxy);
+            if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass);
+        }
+        if (!s) { r.winErr = ERROR_NOT_FOUND; return r; }   // системного прокси нет - маршрута нет
     } else {
-        hSession = WinHttpOpen(L"ygg-watchdog/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        s = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     }
+    if (!s) { r.winErr = GetLastError(); return r; }
+    WinHttpSetTimeouts(s, 5000, 5000, 15000, (int)recvTimeoutMs);
+    HINTERNET c = WinHttpConnect(s, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET q = c ? WinHttpOpenRequest(c, method, path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (q) {
+        std::wstring hdr = L"User-Agent: ygg-watchdog\r\n" + headers;
+        BOOL sent = WinHttpSendRequest(q, hdr.c_str(), (DWORD)hdr.size(),
+                                       body ? (LPVOID)body->data() : WINHTTP_NO_REQUEST_DATA,
+                                       body ? (DWORD)body->size() : 0, body ? (DWORD)body->size() : 0, 0);
+        if (sent && WinHttpReceiveResponse(q, nullptr)) {
+            r.transportOk = true;
+            DWORD sz = sizeof(r.status);
+            WinHttpQueryHeaders(q, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &r.status, &sz, WINHTTP_NO_HEADER_INDEX);
+            DWORD len = 0; sz = sizeof(len);
+            r.haveLen = WinHttpQueryHeaders(q, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &len, &sz, WINHTTP_NO_HEADER_INDEX) != FALSE;
+            r.expectedLen = len;
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(q, &avail)) { r.readOk = false; break; }
+                if (avail == 0) break;
+                std::vector<char> buf(avail);
+                DWORD got = 0;
+                if (!WinHttpReadData(q, buf.data(), avail, &got)) { r.readOk = false; break; }
+                r.gotLen += got;
+                if (sink && r.status == 200) { if (!sink(buf.data(), got)) { r.readOk = false; break; } }
+                else if (r.body.size() < maxBody) r.body.append(buf.data(), got);
+            }
+        } else {
+            r.winErr = GetLastError();
+        }
+        WinHttpCloseHandle(q);
+    } else {
+        r.winErr = GetLastError();
+    }
+    if (c) WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    return r;
+}
 
-    if (ieProxyConfig.lpszAutoConfigUrl) GlobalFree(ieProxyConfig.lpszAutoConfigUrl);
-    if (ieProxyConfig.lpszProxy) GlobalFree(ieProxyConfig.lpszProxy);
-    if (ieProxyConfig.lpszProxyBypass) GlobalFree(ieProxyConfig.lpszProxyBypass);
+std::wstring RouteToText(const HttpRoute& r) { return r.kind + L"|" + r.proxy + L"|" + r.label; }
+bool RouteFromText(const std::wstring& t, HttpRoute& r) {
+    size_t a = t.find(L'|'), b = a == std::wstring::npos ? a : t.find(L'|', a + 1);
+    if (b == std::wstring::npos) return false;
+    r.kind = t.substr(0, a); r.proxy = t.substr(a + 1, b - a - 1); r.label = t.substr(b + 1);
+    return r.kind == L"direct" || r.kind == L"ie" || (r.kind == L"proxy" && !r.proxy.empty());
+}
 
-    return hSession;
+// Подсказки от VPN-клиента: реестр и файл в ProgramData
+std::vector<std::wstring> ProxyHints() {
+    std::vector<std::wstring> v;
+    std::wstring reg = util::Trim(util::RegReadPath(REG_YOZMOR, L"LocalProxy"));
+    if (!reg.empty()) v.push_back(reg);
+    wchar_t pd[MAX_PATH] = L"";
+    ExpandEnvironmentStringsW(L"%ProgramData%\\Yozmor\\local_proxy.txt", pd, MAX_PATH);
+    std::wstring f = util::FromUtf8(util::ReadFileBytes(pd));
+    size_t nl = f.find_first_of(L"\r\n");
+    f = util::Trim(nl == std::wstring::npos ? f : f.substr(0, nl));
+    if (!f.empty() && std::find(v.begin(), v.end(), f) == v.end()) v.push_back(f);
+    for (auto& h : v) { size_t p = h.find(L"://"); if (p != std::wstring::npos) h = h.substr(p + 3); }   // http://127.0.0.1:2080 -> 127.0.0.1:2080
+    return v;
+}
+
+// Встроенный список VPN-клиентов (части имени exe) + свои из PROXY_CLIENTS
+std::vector<std::wstring> ProxyClientNames() {
+    std::vector<std::wstring> v = { L"karing", L"sing-box", L"singbox", L"xray", L"v2ray", L"nekoray", L"nekobox", L"throne",
+                                    L"hiddify", L"clash", L"mihomo", L"naive", L"happ", L"invisible" };
+    for (const auto& x : SplitBy(LoadNotifyConfig().proxyClients, L',')) {
+        std::wstring t = util::Lower(util::Trim(x));
+        if (t.size() > 4 && t.compare(t.size() - 4, 4, L".exe") == 0) t.resize(t.size() - 4);
+        if (!t.empty()) v.push_back(t);
+    }
+    return v;
+}
+
+// Пускает ли HTTP-прокси на 127.0.0.1:port к host:443 (ответ "HTTP/1.x 200" на CONNECT)
+bool TestHttpConnectProxy(unsigned short port, const std::wstring& host) {
+    static util::WsaInit wsa;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return false;
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    connect(s, (sockaddr*)&a, sizeof(a));
+    fd_set w; FD_ZERO(&w); FD_SET(s, &w);
+    timeval tv = { 1, 0 };
+    bool ok = false;
+    if (select(0, nullptr, &w, nullptr, &tv) > 0) {
+        nb = 0;
+        ioctlsocket(s, FIONBIO, &nb);
+        DWORD to = 6000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+        std::string h = util::ToUtf8(host);
+        std::string req = "CONNECT " + h + ":443 HTTP/1.1\r\nHost: " + h + ":443\r\n\r\n";
+        if (send(s, req.data(), (int)req.size(), 0) == (int)req.size()) {
+            char buf[256];
+            int n = recv(s, buf, sizeof(buf) - 1, 0);
+            if (n >= 12) {
+                buf[n] = 0;
+                std::string resp(buf, n);
+                ok = resp.compare(0, 7, "HTTP/1.") == 0 && resp.compare(9, 3, "200") == 0;
+            }
+        }
+    }
+    closesocket(s);
+    return ok;
+}
+
+// Автопоиск: известные VPN-клиенты, слушающие 127.0.0.1 / 0.0.0.0, чей порт пускает к host
+std::vector<HttpRoute> ScanLocalProxies(const std::wstring& host) {
+    std::vector<HttpRoute> out;
+    DWORD size = 0;
+    GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+    std::vector<BYTE> buf(size + 4096);
+    size = (DWORD)buf.size();
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) return out;
+    auto* t = (MIB_TCPTABLE_OWNER_PID*)buf.data();
+    auto names = ProxyClientNames();
+    std::map<DWORD, std::wstring> procName;
+    std::set<unsigned short> tried;
+    for (DWORD i = 0; i < t->dwNumEntries && out.size() < 3 && tried.size() < 20; ++i) {
+        const auto& row = t->table[i];
+        DWORD addr = ntohl(row.dwLocalAddr);
+        if (addr != INADDR_LOOPBACK && addr != INADDR_ANY) continue;
+        unsigned short port = ntohs((u_short)row.dwLocalPort);
+        if (tried.count(port)) continue;
+        if (!procName.count(row.dwOwningPid)) {
+            std::wstring n;
+            HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, row.dwOwningPid);
+            if (p) {
+                wchar_t path[MAX_PATH * 2]; DWORD len = MAX_PATH * 2;
+                if (QueryFullProcessImageNameW(p, 0, path, &len)) n = std::filesystem::path(path).filename().wstring();
+                CloseHandle(p);
+            }
+            procName[row.dwOwningPid] = n;
+        }
+        std::wstring pn = procName[row.dwOwningPid], low = util::Lower(pn);
+        bool known = false;
+        for (const auto& k : names) if (!k.empty() && low.find(k) != std::wstring::npos) { known = true; break; }
+        if (!known) continue;
+        tried.insert(port);
+        if (TestHttpConnectProxy(port, host)) {
+            std::wstring a = L"127.0.0.1:" + std::to_wstring(port);
+            std::wstring clean = pn.size() > 4 && util::Lower(pn.substr(pn.size() - 4)) == L".exe" ? pn.substr(0, pn.size() - 4) : pn;
+            out.push_back({ L"proxy", a, clean + L" (" + a + L")" });
+        }
+    }
+    return out;
+}
+
+// Сам запрос: маршруты по очереди. allowProxies=false - только напрямую
+// (GeoIP: нужна страна, откуда выходят соединения самого Yggdrasil, а не прокси).
+HttpResult HttpRequest(const wchar_t* method, const std::wstring& host, const std::wstring& path, const std::wstring& headers,
+                       const std::string* body, const BodySink& sink = nullptr, DWORD recvTimeoutMs = 30000,
+                       bool allowProxies = true, const std::function<void()>& beforeRetry = nullptr) {
+    std::vector<HttpRoute> routes;
+    auto add = [&](const HttpRoute& r) {
+        for (const auto& x : routes) if (x.kind == r.kind && x.proxy == r.proxy) return;
+        routes.push_back(r);
+    };
+    std::wstring cacheKey = L"Route_" + util::Lower(host);
+    HttpRoute cached;
+    if (allowProxies && RouteFromText(util::RegReadPath(REG_WATCHDOG_KEY, cacheKey.c_str()), cached)) add(cached);
+    if (allowProxies) {
+        std::wstring px = LoadNotifyConfig().proxyOverride;
+        if (!px.empty()) add({ L"proxy", px, L"PROXY из notify.conf (" + px + L")" });
+        for (const auto& h : ProxyHints()) add({ L"proxy", h, L"прокси, указанный клиентом (" + h + L")" });
+    }
+    add({ L"direct", L"", L"напрямую" });
+    if (allowProxies) add({ L"ie", L"", L"системный прокси" });
+
+    HttpResult last;
+    auto attempt = [&](const HttpRoute& rt) {
+        if (beforeRetry) beforeRetry();
+        HttpResult r = HttpOnce(rt, method, host, path, headers, body, sink, recvTimeoutMs);
+        if (r.transportOk) {
+            if (allowProxies && RouteToText(rt) != RouteToText(cached))
+                util::RegWriteString(REG_WATCHDOG_KEY, cacheKey.c_str(), RouteToText(rt));   // без прав (трей) - молча не запишется
+            last = r;
+            return true;
+        }
+        if (r.winErr != ERROR_NOT_FOUND) last = r;
+        return false;
+    };
+    for (const auto& rt : routes) if (attempt(rt)) return last;
+    if (allowProxies) {
+        // автопоиск - один раз на сайт за запуск программы (сканирование портов не бесплатное)
+        static std::map<std::wstring, std::vector<HttpRoute>> scanned;
+        std::wstring key = util::Lower(host);
+        if (!scanned.count(key)) scanned[key] = ScanLocalProxies(host);
+        for (const auto& rt : scanned[key]) if (attempt(rt)) return last;
+    }
+    return last;
 }
 
 DWORD g_lastHttpStatus = 0;   // код ответа последнего HttpGetUtf8 (0 - не дошёл)
 
-std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path) {
-    std::string result;
-    g_lastHttpStatus = 0;
-
-    HINTERNET hSession = OpenHttpSessionWithProxy();
-    if (!hSession) return result;
-
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
-
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
-
-    // GitHub требует User-Agent, иначе отдаёт 403
-    std::wstring headers = L"User-Agent: ygg-watchdog\r\n";
-    BOOL sent = WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)headers.size(),
-        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-
-    bool received = sent && WinHttpReceiveResponse(hRequest, nullptr);
-    DWORD statusCode = 0;
-    if (received) {
-        DWORD sz = sizeof(statusCode);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
+std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path, bool allowProxies = true) {
+    HttpResult r = HttpRequest(L"GET", host, path, L"", nullptr, nullptr, 30000, allowProxies);
+    g_lastHttpStatus = r.status;
+    if (!r.transportOk) {
+        LogError(L"HTTP-запрос не удался (WinHTTP " + std::to_wstring(r.winErr) + L"): " + host + path);
+        return "";
     }
-    g_lastHttpStatus = statusCode;
-    if (received && statusCode == 404) {
-        // для releases/latest это просто "релизов ещё нет" - не ошибка
-        LogDebug(L"HTTP 404 от " + host + path);
-    } else if (received && statusCode != 200) {
+    if (r.status == 404) { LogDebug(L"HTTP 404 от " + host + path); return ""; }
+    if (r.status != 200) {
         // 403/429 у api.github.com - обычно лимит запросов без авторизации (60 в час)
-        LogError(L"HTTP " + std::to_wstring(statusCode) + L" от " + host + path);
-    } else if (received) {
-        DWORD bytesAvailable = 0;
-        do {
-            bytesAvailable = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) break;
-            if (bytesAvailable == 0) break;
-
-            std::vector<char> buf(bytesAvailable);
-            DWORD bytesRead = 0;
-            if (WinHttpReadData(hRequest, buf.data(), bytesAvailable, &bytesRead)) {
-                result.append(buf.data(), bytesRead);
-            }
-        } while (bytesAvailable > 0);
-    } else {
-        LogError(L"HTTP-запрос не удался (WinHTTP " + std::to_wstring(GetLastError()) + L"): " + host + path);
+        LogError(L"HTTP " + std::to_wstring(r.status) + L" от " + host + path);
+        return "";
     }
-
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return result;
+    return r.body;
 }
 
 // ------------------------------------------------------------------
@@ -858,7 +1044,7 @@ std::optional<std::wstring> DetectEgressCountryIso() {
         { L"ipapi.co",   L"/json/", "country" },
     };
     for (const auto& p : providers) {
-        std::string body = HttpGetUtf8(p.host, p.path);
+        std::string body = HttpGetUtf8(p.host, p.path, false);   // только напрямую: страна выхода самого Yggdrasil
         if (body.empty()) continue;
         auto iso = ExtractJsonStringField(body, p.field);
         if (iso.has_value() && iso->size() == 2) {
@@ -939,6 +1125,9 @@ struct WatchdogState {
     std::vector<Device> devices;
     std::map<std::wstring, long long> deviceDownSince;
     std::map<std::wstring, long long> deviceEscalatedUntil;
+    std::map<std::wstring, std::vector<std::wstring>> devicePeers;      // общие пиры устройства (задаёт пользователь)
+    std::map<std::wstring, std::vector<std::wstring>> deviceTempPeers;  // какие из них сторож подключил временно
+    std::map<std::wstring, std::wstring> deviceWhy;                     // последний разбор: почему недоступно
 
     // Аварийный режим по критическому заряду батареи
     bool batteryCriticalMode = false;
@@ -985,79 +1174,22 @@ struct WatchdogState {
 // официального публичного датасета geonames.org.
 // ------------------------------------------------------------------
 
-bool HttpPostUtf8(const std::wstring& host, const std::wstring& path, const std::string& body) {
-    bool ok = false;
-
-    HINTERNET hSession = OpenHttpSessionWithProxy();
-    if (!hSession) {
-        LogDebug(L"HttpPostUtf8: WinHttpOpen не удался, код ошибки " + std::to_wstring(GetLastError()));
+// POST (Telegram). err - почему не вышло, via - каким маршрутом ушло.
+bool HttpPostUtf8(const std::wstring& host, const std::wstring& path, const std::string& body,
+                  std::wstring* err = nullptr, std::wstring* via = nullptr) {
+    HttpResult r = HttpRequest(L"POST", host, path, L"Content-Type: application/x-www-form-urlencoded\r\n", &body);
+    if (via) *via = r.via;
+    if (!r.transportOk) {
+        if (err) *err = L"не достучался до " + host + L" ни напрямую, ни через прокси (WinHTTP " + std::to_wstring(r.winErr) + L")";
         return false;
     }
-
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) {
-        LogDebug(L"HttpPostUtf8: WinHttpConnect не удался, код ошибки " + std::to_wstring(GetLastError()));
-        WinHttpCloseHandle(hSession);
-        return false;
+    if (r.status == 200) return true;
+    if (err) {
+        json::Value v;
+        std::wstring desc = json::Parse(r.body, v) ? v[L"description"].str() : L"";
+        *err = L"сервер ответил HTTP " + std::to_wstring(r.status) + (desc.empty() ? L"" : L": " + desc);
     }
-
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!hRequest) {
-        LogDebug(L"HttpPostUtf8: WinHttpOpenRequest не удался, код ошибки " + std::to_wstring(GetLastError()));
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return false;
-    }
-
-    std::wstring headers = L"Content-Type: application/x-www-form-urlencoded\r\n";
-    BOOL sent = WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)headers.size(),
-        (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
-
-    if (!sent) {
-        LogDebug(L"HttpPostUtf8: WinHttpSendRequest не удался, код ошибки " + std::to_wstring(GetLastError()));
-    } else if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        LogDebug(L"HttpPostUtf8: WinHttpReceiveResponse не удался, код ошибки " + std::to_wstring(GetLastError()));
-    } else {
-        DWORD statusCode = 0;
-        DWORD statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-        ok = (statusCode == 200);
-
-        if (!ok) {
-            // Читаем тело ответа - Telegram обычно присылает понятное
-            // текстовое описание причины (например "Unauthorized",
-            // "chat not found") прямо в JSON, это и есть самая полезная
-            // диагностика при неверном токене/chat_id.
-            std::string responseBody;
-            DWORD bytesAvailable = 0;
-            do {
-                bytesAvailable = 0;
-                if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable)) break;
-                if (bytesAvailable == 0) break;
-                std::vector<char> buf(bytesAvailable);
-                DWORD bytesRead = 0;
-                if (WinHttpReadData(hRequest, buf.data(), bytesAvailable, &bytesRead)) {
-                    responseBody.append(buf.data(), bytesRead);
-                }
-            } while (bytesAvailable > 0);
-
-            int wsize = MultiByteToWideChar(CP_UTF8, 0, responseBody.c_str(), -1, nullptr, 0);
-            std::wstring wResponseBody(wsize > 0 ? wsize : 1, 0);
-            if (wsize > 0) {
-                MultiByteToWideChar(CP_UTF8, 0, responseBody.c_str(), -1, &wResponseBody[0], wsize);
-            }
-
-            LogDebug(L"HttpPostUtf8: код ответа " + std::to_wstring(statusCode) +
-                     L", тело ответа: " + wResponseBody);
-        }
-    }
-
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return ok;
+    return false;
 }
 
 // Процентное кодирование UTF-8 байт для тела form-urlencoded запроса
@@ -1096,6 +1228,8 @@ std::wstring GetDeviceName() {
     return L"unknown";
 }
 
+std::wstring g_telegramLastVia, g_telegramLastErr;   // для test-notify
+
 bool SendTelegramNotification(const std::wstring& message) {
     NotifyConfig config = LoadNotifyConfig();
     if (!config.valid) return false;
@@ -1105,10 +1239,16 @@ bool SendTelegramNotification(const std::wstring& message) {
                         "&text=" + UrlEncodeUtf8(fullMessage);
     std::wstring path = L"/bot" + config.botToken + L"/sendMessage";
 
-    bool ok = HttpPostUtf8(L"api.telegram.org", path, body);
-    if (!ok) {
-        LogDebug(L"Не удалось отправить уведомление в Telegram");
-    }
+    std::wstring err, via;
+    bool ok = HttpPostUtf8(L"api.telegram.org", path, body, &err, &via);
+    g_telegramLastVia = via;
+    g_telegramLastErr = err;
+    // итог - в реестр, окно покажет «последняя отправка» (трей без прав - не запишет, это не страшно)
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastAt", std::to_wstring((long long)time(nullptr)));
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastOk", ok ? L"1" : L"0");
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastVia", ok ? via : L"");
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastErr", ok ? L"" : err);
+    if (!ok) LogError(L"Telegram: сообщение не отправлено - " + err);   // раньше это было видно только с -v
     return ok;
 }
 
@@ -1443,6 +1583,13 @@ WatchdogState LoadState() {
                 m[entry.substr(0, colon)] = num(entry.substr(colon + 1));
             }
         }
+        else if (key == L"device_peers" || key == L"device_temp_peers" || key == L"device_why") {   // имя<TAB>значение
+            size_t tab = value.find(L'\t');
+            if (tab == std::wstring::npos || tab == 0) continue;
+            std::wstring name = value.substr(0, tab), rest = value.substr(tab + 1);
+            if (key == L"device_why") state.deviceWhy[name] = rest;
+            else (key == L"device_peers" ? state.devicePeers : state.deviceTempPeers)[name] = SplitBy(rest, L' ');
+        }
         else if (key == L"battery_critical_mode") state.batteryCriticalMode = (value == L"1");
         else if (key == L"battery_critical_entered_percent") state.batteryCriticalEnteredPercent = (int)num(value, -1);
         else if (key == L"update_last_checked_at") state.updateLastCheckedAt = num(value);
@@ -1524,6 +1671,13 @@ void SaveState(const WatchdogState& state) {
     for (const auto& [name, t] : state.deviceEscalatedUntil) esc.push_back(name + L":" + std::to_wstring(t));
     put(L"device_down_since", JoinBy(down, L";"));
     put(L"device_escalated_until", JoinBy(esc, L";"));
+    for (const auto& [n, v] : state.devicePeers) if (!v.empty()) put(L"device_peers", n + L"\t" + JoinBy(v, L" "));
+    for (const auto& [n, v] : state.deviceTempPeers) if (!v.empty()) put(L"device_temp_peers", n + L"\t" + JoinBy(v, L" "));
+    for (const auto& [n, w] : state.deviceWhy) {
+        std::wstring c = w;
+        for (auto& ch : c) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+        if (!c.empty()) put(L"device_why", n + L"\t" + c);
+    }
     put(L"battery_critical_mode", b(state.batteryCriticalMode));
     put(L"battery_critical_entered_percent", std::to_wstring(state.batteryCriticalEnteredPercent));
     put(L"update_last_checked_at", std::to_wstring(state.updateLastCheckedAt));
@@ -1570,6 +1724,7 @@ void SaveTickState(WatchdogState& state) {
     state.homeRegion = disk.homeRegion;
     state.homeCity = disk.homeCity;
     state.devices = disk.devices;
+    state.devicePeers = disk.devicePeers;
     for (auto it = state.deviceDownSince.begin(); it != state.deviceDownSince.end();) {
         bool still = false;
         for (const auto& d : state.devices) if (d.name == it->first) still = true;
@@ -1896,6 +2051,174 @@ const long long DEVICE_ESCALATION_COOLDOWN_SECONDS = 3600;
 // Определена ниже (после Tick()) - предварительное объявление, чтобы
 // CheckDevices мог её вызвать при подтверждённой локальной перегрузке.
 void RestartYggdrasilServiceNow();
+bool RunApprovedVpnCommand(const std::wstring& args);   // ниже, в разделе про VPN
+
+// ------------------------------------------------------------------
+// Почему устройство недоступно. Проверки по порядку, первая найденная
+// причина и есть ответ:
+//   1. отвечает ли свой Yggdrasil (yggdrasilctl);
+//   2. куда Windows отправит пакет: через адаптер Yggdrasil или через
+//      чужой (обычно VPN-клиент в TUN-режиме перехватывает маршрут);
+//   3. уходит ли пакет вообще: "общий сбой" ICMP = его режут прямо здесь
+//      (VPN-клиент, фаервол, антивирус);
+//   4. знает ли Yggdrasil путь / сессию до устройства (getPaths / getSessions):
+//      нет - сеть его не находит (выключено, нет пиров, Yggdrasil там лежит);
+//   5. путь есть, а ответа нет - причина на самом устройстве.
+// Подробно - только для адресов Yggdrasil (200::/7).
+// ------------------------------------------------------------------
+struct DeviceDiag {
+    std::wstring kind;   // ok / ygg_down / route / local_block / no_path / no_answer / other
+    std::wstring text;   // по-человечески
+    std::wstring vpn;    // замеченные адаптеры VPN-клиентов
+};
+
+bool IsYggAddress(const in6_addr& a) { return (a.s6_addr[0] & 0xFE) == 0x02; }
+
+struct IcmpResult { bool ok = false; double ms = -1; DWORD err = 0; };
+
+IcmpResult Ping6Detailed(const in6_addr& dst, DWORD timeoutMs) {
+    IcmpResult r;
+    sockaddr_in6 d = {}, s = {};
+    d.sin6_family = AF_INET6; d.sin6_addr = dst;
+    s.sin6_family = AF_INET6;
+    HANDLE h = Icmp6CreateFile();
+    if (h == INVALID_HANDLE_VALUE) { r.err = GetLastError(); return r; }
+    char data[32] = "ygg-watchdog";
+    std::vector<char> reply(sizeof(ICMPV6_ECHO_REPLY) + sizeof(data) + 64);
+    DWORD n = Icmp6SendEcho2(h, nullptr, nullptr, nullptr, &s, &d, data, (WORD)sizeof(data), nullptr,
+                             reply.data(), (DWORD)reply.size(), timeoutMs);
+    if (n > 0) {
+        auto* rp = (ICMPV6_ECHO_REPLY*)reply.data();
+        if (rp->Status == IP_SUCCESS) { r.ok = true; r.ms = rp->RoundTripTime; }
+        else r.err = rp->Status;
+    } else {
+        r.err = GetLastError();
+    }
+    IcmpCloseHandle(h);
+    return r;
+}
+
+// Сетевые адаптеры: какой держит адрес Yggdrasil, и какие включённые адаптеры похожи на VPN-туннели
+struct AdapterScan { ULONG yggIndex = 0; std::wstring yggName; bool yggUp = false; std::vector<std::wstring> vpn; std::map<ULONG, std::wstring> names; };
+
+AdapterScan ScanAdapters(const in6_addr* yggAddr) {
+    AdapterScan sc;
+    ULONG size = 64 * 1024;
+    std::vector<BYTE> buf(size);
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &size);
+    if (rc == ERROR_BUFFER_OVERFLOW) { buf.resize(size); rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &size); }
+    if (rc != NO_ERROR) return sc;
+    static const wchar_t* vpnWords[] = { L"tun", L"wintun", L"wireguard", L"tap-windows", L"v2ray", L"sing", L"xray", L"outline",
+                                         L"amnezia", L"hiddify", L"nekoray", L"clash", L"openvpn", L"vpn" };
+    for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+        std::wstring fname = a->FriendlyName ? a->FriendlyName : L"", desc = a->Description ? a->Description : L"";
+        sc.names[a->Ipv6IfIndex] = fname;
+        bool isYgg = false;
+        if (yggAddr)
+            for (auto* u = a->FirstUnicastAddress; u; u = u->Next)
+                if (u->Address.lpSockaddr && u->Address.lpSockaddr->sa_family == AF_INET6 &&
+                    memcmp(&((sockaddr_in6*)u->Address.lpSockaddr)->sin6_addr, yggAddr, sizeof(in6_addr)) == 0) isYgg = true;
+        if (isYgg) { sc.yggIndex = a->Ipv6IfIndex; sc.yggName = fname; sc.yggUp = a->OperStatus == IfOperStatusUp; continue; }
+        if (a->OperStatus != IfOperStatusUp) continue;
+        std::wstring low = util::Lower(fname + L" " + desc);
+        for (const wchar_t* w : vpnWords) if (low.find(w) != std::wstring::npos) { sc.vpn.push_back(fname); break; }
+    }
+    return sc;
+}
+
+// Знает ли Yggdrasil путь или сессию до адреса
+bool YggKnowsPath(const in6_addr& target) {
+    const std::pair<const wchar_t*, const wchar_t*> cmds[] = { { L"getPaths", L"paths" }, { L"getSessions", L"sessions" } };
+    for (const auto& c : cmds) {
+        json::Value v;
+        std::wstring err;
+        if (!ygg::Ctl(ygg::CtlPaths(), c.first, v, err)) continue;
+        const auto& arr = v[c.second];
+        for (size_t i = 0; i < arr.size(); ++i) {
+            in6_addr a;
+            if (InetPtonW(AF_INET6, arr[i][L"address"].str().c_str(), &a) == 1 && memcmp(&a, &target, sizeof(a)) == 0) return true;
+        }
+    }
+    return false;
+}
+
+bool IsYggdrasilResponsive();   // ниже
+
+DeviceDiag DiagnoseDevice(const std::wstring& hostIn) {
+    DeviceDiag dg;
+    std::wstring host = NormalizeIpv6(hostIn);
+    in6_addr target;
+    if (InetPtonW(AF_INET6, host.c_str(), &target) != 1 || !IsYggAddress(target)) {
+        dg.kind = L"other";
+        dg.text = L"не отвечает (подробный разбор - только для адресов Yggdrasil 200::/7)";
+        return dg;
+    }
+    if (!IsYggdrasilResponsive()) {
+        dg.kind = L"ygg_down";
+        dg.text = L"Yggdrasil на этом компьютере не отвечает (служба зависла или перегружена)";
+        return dg;
+    }
+    in6_addr self = {};
+    bool haveSelf = false;
+    {
+        json::Value v; std::wstring err;
+        if (ygg::Ctl(ygg::CtlPaths(), L"getSelf", v, err)) haveSelf = InetPtonW(AF_INET6, v[L"address"].str().c_str(), &self) == 1;
+    }
+    AdapterScan sc = ScanAdapters(haveSelf ? &self : nullptr);
+    dg.vpn = JoinBy(sc.vpn, L", ");
+    std::wstring vpnNote = sc.vpn.empty() ? L"" : L" Включены адаптеры VPN-клиентов: " + dg.vpn + L".";
+
+    if (haveSelf && (sc.yggIndex == 0 || !sc.yggUp)) {
+        dg.kind = L"route";
+        dg.text = sc.yggIndex == 0 ? L"у адаптера Yggdrasil на этом компьютере нет его адреса - трафик Yggdrasil не идёт"
+                                   : L"адаптер Yggdrasil «" + sc.yggName + L"» на этом компьютере выключен";
+        return dg;
+    }
+    // куда Windows отправит пакет
+    SOCKADDR_INET dst = {};
+    dst.Ipv6.sin6_family = AF_INET6;
+    dst.Ipv6.sin6_addr = target;
+    MIB_IPFORWARD_ROW2 row = {};
+    SOCKADDR_INET src = {};
+    DWORD rr = GetBestRoute2(nullptr, 0, nullptr, &dst, 0, &row, &src);
+    if (rr != NO_ERROR) {
+        dg.kind = L"route";
+        dg.text = L"у Windows нет маршрута к адресу устройства (нет маршрута 200::/7 через адаптер Yggdrasil)." + vpnNote;
+        return dg;
+    }
+    if (sc.yggIndex != 0 && row.InterfaceIndex != sc.yggIndex) {
+        auto it = sc.names.find(row.InterfaceIndex);
+        std::wstring via = it != sc.names.end() && !it->second.empty() ? it->second : L"адаптер №" + std::to_wstring(row.InterfaceIndex);
+        dg.kind = L"route";
+        dg.text = L"пакеты к устройству Windows отправляет через «" + via + L"», а не через адаптер Yggdrasil - "
+                  L"маршрут перехвачен (обычно VPN-клиентом в TUN-режиме)." + vpnNote;
+        return dg;
+    }
+    // уходит ли пакет
+    IcmpResult ir = Ping6Detailed(target, 2000);
+    if (!ir.ok) ir = Ping6Detailed(target, 2000);
+    if (ir.ok) { dg.kind = L"ok"; dg.text = L"отвечает на ping"; return dg; }
+    if (ir.err == IP_GENERAL_FAILURE || ir.err == ERROR_ACCESS_DENIED || ir.err == ERROR_NETWORK_ACCESS_DENIED) {
+        dg.kind = L"local_block";
+        dg.text = sc.vpn.empty()
+            ? L"пакет к устройству блокируется прямо на этом компьютере («общий сбой» ICMP) - исходящий IPv6 режет фаервол или антивирус"
+            : L"пакет к устройству блокируется прямо на этом компьютере («общий сбой» ICMP). Похоже, VPN-клиент в TUN-режиме ("
+              + dg.vpn + L") режет весь исходящий IPv6 - нужен ygg-tun-fix или выключить TUN-режим";
+        return dg;
+    }
+    // путь в сети Yggdrasil
+    if (!YggKnowsPath(target)) {
+        dg.kind = L"no_path";
+        dg.text = L"сеть Yggdrasil не находит путь до устройства: оно выключено, Yggdrasil на нём не работает, "
+                  L"или ваши пиры не связаны между собой";
+        return dg;
+    }
+    dg.kind = L"no_answer";
+    dg.text = L"путь до устройства в сети есть, но оно не отвечает - причина на самом устройстве "
+              L"(завис Yggdrasil, система или фаервол там)";
+    return dg;
+}
 
 struct DevPingJob { std::wstring host; bool ok = false; };
 DWORD WINAPI DevPingThread(LPVOID p) {
@@ -1926,68 +2249,136 @@ std::vector<std::pair<std::wstring, std::wstring>> CheckDevices(WatchdogState& s
     }
     for (HANDLE h : threads) CloseHandle(h);
 
+    // какие пиры сейчас в Yggdrasil (для временных общих пиров)
+    auto livePeers = GetPeerDetails();
+    auto inYgg = [&](const std::wstring& uri) { return FindPeer(livePeers, uri) != nullptr; };
+    auto removeTemp = [&](const std::wstring& name) {
+        auto it = state.deviceTempPeers.find(name);
+        if (it == state.deviceTempPeers.end()) return std::wstring();
+        std::vector<std::wstring> removed;
+        for (const auto& u : it->second)
+            if (std::find(state.backupPeers.begin(), state.backupPeers.end(), u) == state.backupPeers.end()) { RemovePeer(u); removed.push_back(u); }
+        state.deviceTempPeers.erase(it);
+        return JoinBy(removed, L", ");
+    };
+
     for (size_t di = 0; di < state.devices.size(); ++di) {
         const auto& dev = state.devices[di];
         bool reachable = (*jobs)[di].ok;
         auto downIt = state.deviceDownSince.find(dev.name);
         bool wasDown = (downIt != state.deviceDownSince.end());
+        std::wstring who = L"Устройство '" + dev.name + L"' (" + dev.host + L")";
 
         if (reachable) {
             if (wasDown) {
                 long long downtimeSec = now - downIt->second;
                 state.deviceDownSince.erase(dev.name);
                 state.deviceEscalatedUntil.erase(dev.name);
+                state.deviceWhy.erase(dev.name);
+                std::wstring removed = removeTemp(dev.name);
                 events.push_back({ L"device_recovered",
-                    L"Устройство '" + dev.name + L"' (" + dev.host + L") снова на связи. "
-                    L"Было недоступно " + std::to_wstring(downtimeSec / 60) + L" мин " +
-                    std::to_wstring(downtimeSec % 60) + L" сек." });
+                    who + L" снова на связи. Было недоступно " + std::to_wstring(downtimeSec / 60) + L" мин " +
+                    std::to_wstring(downtimeSec % 60) + L" сек." +
+                    (removed.empty() ? L"" : L" Временные общие пиры убраны: " + removed + L".") });
             }
             continue;
         }
 
+        DeviceDiag dg = DiagnoseDevice(dev.host);
+        if (dg.kind == L"ok") continue;   // пока разбирались - ответило; на следующей проверке будет "на связи"
+        std::wstring prevWhy = state.deviceWhy[dev.name];
+        state.deviceWhy[dev.name] = dg.text;
+
         if (!wasDown) {
             state.deviceDownSince[dev.name] = now;
-            events.push_back({ L"device_unreachable",
-                L"Устройство '" + dev.name + L"' (" + dev.host + L") не отвечает." });
-            continue; // эскалация - только если недоступность подтвердится на следующей проверке
+            events.push_back({ L"device_unreachable", who + L" не отвечает: " + dg.text + L"." });
+            continue; // меры - только если недоступность подтвердится на следующей проверке
         }
+        if (dg.text != prevWhy)
+            events.push_back({ L"device_unreachable", who + L" по-прежнему недоступно, причина другая: " + dg.text + L"." });
 
         auto escIt = state.deviceEscalatedUntil.find(dev.name);
-        bool onCooldown = (escIt != state.deviceEscalatedUntil.end() && now < escIt->second);
-        if (onCooldown) continue;
-
+        if (escIt != state.deviceEscalatedUntil.end() && now < escIt->second) continue;   // меры - не чаще раза в час
         state.deviceEscalatedUntil[dev.name] = now + DEVICE_ESCALATION_COOLDOWN_SECONDS;
 
-        if (!IsYggdrasilResponsive()) {
-            LogInfo(L"Устройство '" + dev.name + L"' недоступно, и сам Yggdrasil не отзывается - "
-                    L"перезапускаю службу");
-            events.push_back({ L"device_unreachable",
-                L"Устройство '" + dev.name + L"' недоступно, Yggdrasil на этой машине перегружен/не отзывается - "
-                L"перезапускаю службу." });
+        // ---- что можно сделать на этом компьютере
+        std::wstring action;
+        bool tried = false;
+        if (dg.kind == L"ygg_down" || dg.kind == L"route") {
+            action = dg.kind == L"ygg_down" ? L"перезапускаю службу Yggdrasil"
+                                           : L"перезапускаю службу Yggdrasil - она заново создаст адаптер и маршрут 200::/7";
+            if (dg.kind == L"route" && !dg.vpn.empty()) action += L" (если маршрут снова перехватит VPN-клиент - не поможет)";
             RestartYggdrasilServiceNow();
+            Sleep(15000);
+            tried = true;
+        } else if (dg.kind == L"local_block") {
+            if (RunApprovedVpnCommand(L"restart")) { action = L"запустил одобренный VPN-скрипт"; Sleep(10000); tried = true; }
+            else action = L"в VPN-клиент и фаервол сторож не лезет - нужно поправить руками";
+        } else if (dg.kind == L"no_path") {
+            std::vector<std::wstring> add;
+            auto pit = state.devicePeers.find(dev.name);
+            if (pit != state.devicePeers.end())
+                for (const auto& u : pit->second) if (!u.empty() && !inYgg(u)) add.push_back(u);
+            if (!add.empty()) {
+                for (const auto& u : add) AddPeer(u);
+                auto& tmp = state.deviceTempPeers[dev.name];
+                for (const auto& u : add) if (std::find(tmp.begin(), tmp.end(), u) == tmp.end()) tmp.push_back(u);
+                action = L"временно подключил общие пиры с устройством: " + JoinBy(add, L", ");
+                Sleep(15000);
+                tried = true;
+            } else if (pit == state.devicePeers.end() || pit->second.empty()) {
+                action = L"общий пир для устройства не задан (вкладка «Устройства») - с ним маршрут нашёлся бы надёжнее";
+            } else {
+                action = L"общие пиры с устройством уже подключены - похоже, оно само выключено или без связи";
+            }
         } else {
-            LogDebug(L"Устройство '" + dev.name + L"' недоступно, но Yggdrasil отзывается нормально - "
-                     L"похоже, проблема не в локальной нагрузке");
+            action = L"с этого компьютера тут ничего не исправить";
         }
+        LogInfo(who + L": " + dg.text + L" - " + action);
+        std::wstring result;
+        if (tried) result = PingDeviceDebounced(dev.host) ? L" Помогло: устройство отвечает." : L" Пока не помогло.";
+        events.push_back({ tried ? L"device_action" : L"device_unreachable",
+                           who + L" недоступно: " + dg.text + L". Что делаю: " + action + L"." + result });
     }
 
     return events;
 }
 
-void CmdAddDevice(const std::wstring& name, const std::wstring& host) {
+// add-device <имя> <адрес> [общий пир ...]: пиры, к которым подключено и само
+// устройство - сторож подключит их на время, если путь до устройства не
+// находится. Без пиров у существующего устройства они не меняются;
+// "--no-peers" - очистить.
+void CmdAddDevice(const std::wstring& name, const std::wstring& host, const std::vector<std::wstring>& peers = {}, bool setPeers = false) {
     if (name.empty() || host.empty()) { PrintError(L"имя и адрес устройства не могут быть пустыми - устройство не добавлено."); return; }
+    for (const auto& p : peers)
+        if (p.find(L"://") == std::wstring::npos) { PrintError(L"пир должен быть вида tls://host:port: " + p); return; }
     WatchdogState state = LoadState();
+    bool found = false;
+    std::wstring canon = name;
     for (auto& d : state.devices) {
-        if (_wcsicmp(d.name.c_str(), name.c_str()) == 0) {
-            d.host = host;
-            SaveState(state);
-            LogInfo(L"Устройство обновлено: " + name + L" -> " + host);
-            return;
-        }
+        if (_wcsicmp(d.name.c_str(), name.c_str()) == 0) { d.host = host; found = true; canon = d.name; break; }
     }
-    state.devices.push_back({ name, host });
+    if (!found) state.devices.push_back({ name, host });
+    if (setPeers) {
+        if (peers.empty()) state.devicePeers.erase(canon); else state.devicePeers[canon] = peers;
+    }
     SaveState(state);
-    LogInfo(L"Устройство добавлено: " + name + L" (" + host + L")");
+    std::wstring pl = state.devicePeers.count(canon) ? L", общие пиры: " + JoinBy(state.devicePeers[canon], L" ") : L"";
+    LogInfo(std::wstring(found ? L"Устройство обновлено: " : L"Устройство добавлено: ") + canon + L" (" + host + L")" + pl);
+}
+
+// diagnose-device [имя]: разобрать недоступность прямо сейчас (без мер)
+void CmdDiagnoseDevice(const std::wstring& name) {
+    WatchdogState state = LoadState();
+    bool any = false;
+    for (const auto& d : state.devices) {
+        if (!name.empty() && _wcsicmp(d.name.c_str(), name.c_str()) != 0) continue;
+        any = true;
+        if (PingDeviceDebounced(d.host)) { Print(d.name + L": на связи."); continue; }
+        DeviceDiag dg = DiagnoseDevice(d.host);
+        Print(d.name + L": " + (dg.kind == L"ok" ? L"на связи." : L"недоступно - " + dg.text + L"."));
+    }
+    if (!any) PrintError(name.empty() ? L"устройств не добавлено." : L"устройство не найдено: " + name);
 }
 
 void CmdRemoveDevice(const std::wstring& name) {
@@ -2001,6 +2392,14 @@ void CmdRemoveDevice(const std::wstring& name) {
     }
     state.deviceDownSince.erase(name);
     state.deviceEscalatedUntil.erase(name);
+    state.deviceWhy.erase(name);
+    state.devicePeers.erase(name);
+    auto tp = state.deviceTempPeers.find(name);
+    if (tp != state.deviceTempPeers.end()) {
+        for (const auto& u : tp->second)
+            if (std::find(state.backupPeers.begin(), state.backupPeers.end(), u) == state.backupPeers.end()) RemovePeer(u);
+        state.deviceTempPeers.erase(tp);
+    }
     SaveState(state);
     LogInfo(L"Устройство удалено: " + name);
 }
@@ -2014,7 +2413,8 @@ void CmdListDevices() {
     Print(L"Устройства для мониторинга (" + std::to_wstring(state.devices.size()) + L"):");
     for (const auto& d : state.devices) {
         bool down = state.deviceDownSince.count(d.name) > 0;
-        Print(L"  " + d.name + L" (" + d.host + L")" + (down ? L" - НЕДОСТУПНО" : L" - ок"));
+        Print(L"  " + d.name + L" (" + d.host + L")" + (down ? L" - НЕДОСТУПНО: " + state.deviceWhy[d.name] : L" - ок"));
+        if (state.devicePeers.count(d.name)) Print(L"      общие пиры: " + JoinBy(state.devicePeers[d.name], L" "));
     }
 }
 
@@ -2364,51 +2764,19 @@ bool DownloadFile(const std::wstring& url, const std::wstring& destPath) {
     if (!std::regex_match(url, m, urlRe)) return false;
     std::wstring host = m[1].str(), path = m[2].str();
 
-    HINTERNET hSession = OpenHttpSessionWithProxy();
-    if (!hSession) return false;
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    bool ok = false;
-    if (hRequest) {
-        std::wstring headers = L"User-Agent: ygg-watchdog\r\n";
-        if (WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)headers.size(),
-                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-            WinHttpReceiveResponse(hRequest, nullptr)) {
-            DWORD status = 0, sz = sizeof(status);
-            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
-            DWORD expected = 0; sz = sizeof(expected);
-            bool haveLen = WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                                               WINHTTP_HEADER_NAME_BY_INDEX, &expected, &sz, WINHTTP_NO_HEADER_INDEX) != FALSE;
-            if (status != 200) {
-                LogError(L"Скачивание: сервер ответил HTTP " + std::to_wstring(status));
-            } else {
-                std::ofstream out(std::filesystem::path(destPath), std::ios::binary | std::ios::trunc);
-                unsigned long long total = 0;
-                bool readOk = out.is_open();
-                DWORD avail = 0;
-                while (readOk) {
-                    avail = 0;
-                    if (!WinHttpQueryDataAvailable(hRequest, &avail)) { readOk = false; break; }
-                    if (avail == 0) break;
-                    std::vector<char> buf(avail);
-                    DWORD readBytes = 0;
-                    if (!WinHttpReadData(hRequest, buf.data(), avail, &readBytes)) { readOk = false; break; }
-                    out.write(buf.data(), readBytes);
-                    total += readBytes;
-                }
-                out.close();
-                ok = readOk && total > 0 && (!haveLen || total == expected);
-                if (!ok) LogError(L"Скачивание оборвалось: получено " + std::to_wstring(total) + L" байт" +
-                                  (haveLen ? L" из " + std::to_wstring(expected) : L""));
-            }
-        }
-        WinHttpCloseHandle(hRequest);
-    }
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    std::ofstream out;
+    auto reopen = [&]() {   // перед каждым маршрутом - файл заново
+        if (out.is_open()) out.close();
+        out.open(std::filesystem::path(destPath), std::ios::binary | std::ios::trunc);
+    };
+    BodySink sink = [&](const char* d, DWORD n) { out.write(d, n); return out.good(); };
+    HttpResult r = HttpRequest(L"GET", host, path, L"", nullptr, sink, 60000, true, reopen);
+    if (out.is_open()) out.close();
+    if (!r.transportOk) { LogError(L"Скачивание: не достучался до " + host + L" (WinHTTP " + std::to_wstring(r.winErr) + L")"); return false; }
+    if (r.status != 200) { LogError(L"Скачивание: сервер ответил HTTP " + std::to_wstring(r.status)); return false; }
+    bool ok = r.readOk && r.gotLen > 0 && (!r.haveLen || r.gotLen == r.expectedLen);
+    if (!ok) LogError(L"Скачивание оборвалось: получено " + std::to_wstring(r.gotLen) + L" байт" +
+                      (r.haveLen ? L" из " + std::to_wstring(r.expectedLen) : L""));
     return ok;
 }
 
@@ -3298,7 +3666,7 @@ void RunDeviceChecks(WatchdogState& state) {
     auto deviceEvents = CheckDevices(state);
     for (const auto& [kind, msg] : deviceEvents) {
         LogInfo(msg);
-        Notify(kind == L"device_recovered" ? L"ok" : L"alert", msg);
+        Notify(kind == L"device_recovered" ? L"ok" : kind == L"device_action" ? L"warn" : L"alert", msg);
     }
 }
 
@@ -4056,8 +4424,14 @@ void CmdStatusJson() {
         const auto& d = st.devices[i];
         auto it = st.deviceDownSince.find(d.name);
         if (i) j += L",";
+        auto why = st.deviceWhy.find(d.name);
+        auto pe = st.devicePeers.find(d.name);
+        auto tp = st.deviceTempPeers.find(d.name);
         j += L"{\"name\":" + JStr(d.name) + L",\"host\":" + JStr(d.host) +
-             L",\"down_since\":" + std::to_wstring(it == st.deviceDownSince.end() ? 0 : it->second) + L"}";
+             L",\"down_since\":" + std::to_wstring(it == st.deviceDownSince.end() ? 0 : it->second) +
+             L",\"why\":" + JStr(why == st.deviceWhy.end() ? L"" : why->second) +
+             L",\"peers\":" + JArr(pe == st.devicePeers.end() ? std::vector<std::wstring>() : pe->second) +
+             L",\"temp_peers\":" + JArr(tp == st.deviceTempPeers.end() ? std::vector<std::wstring>() : tp->second) + L"}";
     }
     j += L"]";
     j += L",\"battery\":";
@@ -4070,6 +4444,14 @@ void CmdStatusJson() {
     j += L",\"update_available\":" + JStr(st.updateNotifiedTag);
     j += L",\"vpn_script_approved\":" + std::wstring(vpnApproved ? L"true" : L"false");
     j += L",\"telegram_configured\":" + std::wstring(notifyOn ? L"true" : L"false");
+    {
+        long long at = 0;
+        try { at = std::stoll(util::RegReadPath(REG_WATCHDOG_KEY, L"TgLastAt")); } catch (...) {}
+        j += L",\"telegram_last\":{\"at\":" + std::to_wstring(at) +
+             L",\"ok\":" + (util::RegReadPath(REG_WATCHDOG_KEY, L"TgLastOk") == L"1" ? L"true" : L"false") +
+             L",\"via\":" + JStr(util::RegReadPath(REG_WATCHDOG_KEY, L"TgLastVia")) +
+             L",\"err\":" + JStr(util::RegReadPath(REG_WATCHDOG_KEY, L"TgLastErr")) + L"}";
+    }
     {   // разбор - готовый, из state (считается в конце проверки)
         j += L",\"diagnosis\":{\"verdict\":" + JStr(st.diagVerdict) + L",\"advice\":" + JStr(st.diagAdvice) +
              L",\"any_up\":" + std::wstring(st.diagAnyUp ? L"true" : L"false") + L",\"peers\":[";
@@ -4418,9 +4800,9 @@ void RestartYggdrasilServiceNow() {
     Print(L"Внимание: если подключён к этому компьютеру ЧЕРЕЗ Yggdrasil - "
           L"соединение сейчас оборвётся. Если это твой единственный канал - "
           L"используй отложенный перезапуск вместо этого.");
-    RunSimpleCommand(L"net stop \"" + std::wstring(YGG_SERVICE_NAME) + L"\"");
-    RunSimpleCommand(L"net start \"" + std::wstring(YGG_SERVICE_NAME) + L"\"");
-    LogInfo(L"Служба Yggdrasil перезапущена вручную.");
+    std::wstring err = util::ControlServiceNamed(YGG_SERVICE_NAME, L"restart");   // с таймаутом 20 + 20 с
+    if (err.empty()) LogInfo(L"Служба Yggdrasil перезапущена.");
+    else LogError(L"Перезапуск службы Yggdrasil не удался: " + err);
 }
 
 void RestartYggdrasilServiceDelayed(int delaySeconds) {
@@ -4711,10 +5093,18 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         CmdListDevices();
     } else if (command == L"add-device") {
         if (args.size() < 3) {
-            LogError(L"Использование: add-device <имя> <адрес>");
+            PrintError(L"использование: add-device <имя> <адрес> [общий пир ...] (или --no-peers - убрать общие пиры)");
             return 1;
         }
-        CmdAddDevice(args[1], args[2]);
+        std::vector<std::wstring> peers;
+        bool clear = false;
+        for (size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == L"--no-peers") clear = true;
+            else for (const auto& p : SplitBy(args[i], L' ')) peers.push_back(p);   // из окна - одной строкой через пробел
+        }
+        CmdAddDevice(args[1], args[2], peers, clear || !peers.empty());
+    } else if (command == L"diagnose-device") {
+        CmdDiagnoseDevice(args.size() >= 2 ? args[1] : L"");
     } else if (command == L"remove-device") {
         if (args.size() < 2) {
             LogError(L"Использование: remove-device <имя>");
@@ -4749,10 +5139,10 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
             return 1;
         }
         if (SendTelegramNotification(L"Проверка связи: уведомления ygg-watchdog работают.")) {
-            Print(L"Тестовое сообщение отправлено в Telegram.");
+            Print(L"Тестовое сообщение отправлено в Telegram (" + g_telegramLastVia + L").");
         } else {
-            PrintError(L"Не удалось отправить в Telegram. Проверь токен и chat id; если Telegram "
-                       L"не открывается без VPN - нужен VPN или строка PROXY в notify.conf.");
+            PrintError(L"не отправилось: " + g_telegramLastErr + L". Если дело в доступе - нужен VPN: в TUN-режиме "
+                       L"или с локальным HTTP-прокси (сторож найдёт его сам; свой клиент - PROXY_CLIENTS в notify.conf).");
             return 1;
         }
     } else {
