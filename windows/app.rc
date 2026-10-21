@@ -1,0 +1,6 @@
+// Ресурсы ygg_watchdog.exe (сторож + окно в одном файле).
+// Иконка программы и окна.
+1 ICON "ygg-watchdog.ico"
+// Фон-древо для окна: серая текстура, окно перекрашивает её в цвет темы.
+// Генератор - gui/bgtools/make_bg.py (Pillow + numpy + scipy).
+101 RCDATA "gui/bg_gray.png"
