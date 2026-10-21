@@ -4638,6 +4638,11 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         Tick();
     } else if (command == L"install-task") {
         InstallScheduledTask();
+    } else if (command == L"repair-task") {
+        // из трея, когда автопроверки молчат: задача заново + сразу одна проверка
+        InstallScheduledTask();
+        AppendEvent(L"ok", L"Задача автопроверок восстановлена (по твоему подтверждению).");
+        Tick();
     } else if (command == L"uninstall-task") {
         UninstallScheduledTask();
     } else if (command == L"add-region" || command == L"set-region") {

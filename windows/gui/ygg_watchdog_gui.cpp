@@ -34,6 +34,9 @@
 #include <algorithm>
 #include <set>
 
+// Из ygg_watchdog.cpp (тот же exe): отправка в Telegram по notify.conf
+bool SendTelegramNotification(const std::wstring& message);
+
 namespace gui {
 using namespace ui;
 
@@ -2385,9 +2388,12 @@ namespace tray {
 static const UINT WM_TRAYICON = WM_APP + 20;
 static const UINT_PTR TIMER_POLL = 1;
 static const UINT_PTR TIMER_TOAST = 2;
-enum { ID_OPEN = 1, ID_CHECK, ID_POPUPS, ID_AUTOSTART, ID_EXIT };
+enum { ID_OPEN = 1, ID_CHECK, ID_REPAIR, ID_POPUPS, ID_AUTOSTART, ID_EXIT };
 
-struct Toast { std::wstring level, text; long long ts = 0; };
+// action: 0 - клик открывает окно; 1 - клик восстанавливает задачу (с запросом прав)
+struct Toast { std::wstring level, text; long long ts = 0; int action = 0; };
+
+static const long long OUTAGE_SECONDS = 15 * 60;   // проверок нет дольше - тревога
 
 struct TrayState {
     HINSTANCE hInst = nullptr;
@@ -2398,7 +2404,12 @@ struct TrayState {
     std::wstring phase;
     long long lastTick = 0;
     unsigned long long eventsOffset = 0;
-    bool staleNotified = false;
+    // Автопроверки молчат: тревога одна на простой (и в Telegram, и окном)
+    bool outage = false;              // сейчас простой
+    std::wstring outageWhy;           // почему (для меню и окна)
+    long long awakeSince = 0;         // когда трей запустился / компьютер проснулся
+    long long lastTaskQuery = 0;
+    TaskInfo task;                    // последнее, что сказал Планировщик
     std::vector<Toast> queue;
     Toast cur;
     ULONGLONG shownAt = 0, showFor = 0;
@@ -2572,6 +2583,30 @@ void OpenMainWindow() {
     ShellExecuteW(nullptr, L"open", SelfExe().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// Восстановить задачу Планировщика: трей работает без прав администратора,
+// поэтому запускает "ygg_watchdog.exe repair-task" с запросом прав (UAC) -
+// это и есть твоё разрешение. Отказался в UAC - ничего не меняется.
+void RepairTask() {
+    HINSTANCE r = ShellExecuteW(nullptr, IsUserAnAdmin() ? L"open" : L"runas", SelfExe().c_str(), L"repair-task", nullptr, SW_HIDE);
+    if ((INT_PTR)r <= 32) {
+        Toast t; t.level = L"warn"; t.ts = (long long)time(nullptr);
+        t.text = L"Восстановление отменено (не дано разрешение). Значок в трее → «Восстановить автопроверки…» - попробовать снова.";
+        g.queue.push_back(t);
+    }
+}
+
+// Telegram из трея - в отдельном потоке, чтобы значок не замирал на время отправки
+DWORD WINAPI TelegramThread(LPVOID p) {
+    std::wstring* s = (std::wstring*)p;
+    SendTelegramNotification(*s);
+    delete s;
+    return 0;
+}
+void SendTelegramAsync(const std::wstring& msg) {
+    HANDLE h = CreateThread(nullptr, 0, TelegramThread, new std::wstring(msg), 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
 // ---------- всплывающее окно ----------
 void PlaceToast() {
     RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
@@ -2593,7 +2628,7 @@ void ShowNextToast() {
     g.cur = g.queue.front();
     g.queue.erase(g.queue.begin());
     g.shownAt = GetTickCount64();
-    g.showFor = g.cur.level == L"alert" ? 20000 : 8000;
+    g.showFor = g.cur.action ? 30 * 60 * 1000ULL : g.cur.level == L"alert" ? 20000 : 8000;   // окно с вопросом висит, пока не ответишь
     g.hoverClose = false;
     PlaceToast();
     if (g.rInit) g.r.Resize();
@@ -2628,7 +2663,7 @@ void PaintToast() {
     const Toast& t = g.cur;
     Theme th = t.level == L"alert" ? ThemeRed() : t.level == L"warn" ? ThemeAmber() :
                t.level == L"ok" ? ThemeGreen() : ThemeGray();
-    std::wstring head = t.level == L"alert" ? L"ТРЕВОГА" : t.level == L"warn" ? L"ВНИМАНИЕ" :
+    std::wstring head = t.action == 1 ? L"НУЖНО РАЗРЕШЕНИЕ" : t.level == L"alert" ? L"ТРЕВОГА" : t.level == L"warn" ? L"ВНИМАНИЕ" :
                         t.level == L"ok" ? L"ПОРЯДОК" : L"СОБЫТИЕ";
     r.BeginFrame(th.bg);
     r.Fill(0, 0, TW, TH, Rgb(th.bg));
@@ -2671,7 +2706,10 @@ LRESULT CALLBACK ToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE: g.hoverClose = false; InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_LBUTTONUP: {
         D2D1_POINT_2F p = g.r.ToDesign((short)LOWORD(lp), (short)HIWORD(lp));
-        if (!(p.x > TW - 40 && p.y < 32)) OpenMainWindow();
+        if (!(p.x > TW - 40 && p.y < 32)) {
+            if (g.cur.action == 1) RepairTask();
+            else OpenMainWindow();
+        }
         ShowNextToast();
         return 0;
     }
@@ -2692,6 +2730,7 @@ void ShowMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_OPEN, L"Открыть окно");
     AppendMenuW(m, MF_STRING, ID_CHECK, L"Проверить сейчас");
+    if (g.outage) AppendMenuW(m, MF_STRING, ID_REPAIR, L"Восстановить автопроверки…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (TrayPopupsEnabled() ? MF_CHECKED : 0), ID_POPUPS, L"Всплывающие окна");
     AppendMenuW(m, MF_STRING | (TrayAutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Запускать при входе в Windows");
@@ -2704,6 +2743,7 @@ void ShowMenu() {
     DestroyMenu(m);
     switch (cmd) {
     case ID_OPEN: OpenMainWindow(); break;
+    case ID_REPAIR: RepairTask(); break;
     case ID_CHECK:
         // tick нужны права администратора; результат придёт сюда же через events.log
         ShellExecuteW(nullptr, IsUserAnAdmin() ? L"open" : L"runas", SelfExe().c_str(), L"tick", nullptr, SW_HIDE);
@@ -2714,16 +2754,57 @@ void ShowMenu() {
     }
 }
 
-void Poll() {
-    std::wstring oldPhase = g.phase;
-    ReadState();
-    bool stale = Stale();
-    if (stale && !g.staleNotified) {
-        g.staleNotified = true;
-        Toast t; t.level = L"warn"; t.ts = (long long)time(nullptr);
-        t.text = L"Автопроверка молчит больше 10 минут: задача Планировщика не запускается или висит. Открой окно → «Управление».";
+// Автопроверки молчат? Считается только когда компьютер уже 15 минут как
+// включён / проснулся: после сна задаче нужно время на первый ход, иначе
+// каждое пробуждение давало бы ложную тревогу.
+void CheckOutage() {
+    long long now = (long long)time(nullptr);
+    if (now - g.lastTaskQuery >= 60) { g.task = QueryTask(TASK_NAME); g.lastTaskQuery = now; }
+    bool disabled = g.task.ok && g.task.state == 1;
+    bool silent = g.lastTick > 0 && now - g.lastTick > OUTAGE_SECONDS;
+    bool settled = now - g.awakeSince > OUTAGE_SECONDS;
+    bool problem = settled && (silent || disabled);
+    if (problem && !g.outage) {
+        g.outage = true;
+        long long mins = g.lastTick > 0 ? (now - g.lastTick) / 60 : 0;
+        g.outageWhy = disabled ? L"задача Планировщика выключена"
+                    : !g.task.ok ? L"задача Планировщика не найдена (удалена?) или недоступна"
+                    : L"задача есть, но не отрабатывает (последний результат: " + (TaskResultText(g.task.lastResult).empty()
+                                                                                   ? std::wstring(L"без ошибки") : TaskResultText(g.task.lastResult)) + L")";
+        // Telegram - один раз за простой (помним и после перезапуска трея)
+        DWORD sent = 0, sz = sizeof(sent);
+        bool already = RegGetValueW(HKEY_CURRENT_USER, TRAY_SETTINGS_KEY, L"OutageForTick", RRF_RT_REG_DWORD, nullptr, &sent, &sz) == ERROR_SUCCESS &&
+                       sent == (DWORD)g.lastTick;
+        if (!already) {
+            SendTelegramAsync(L"Автопроверки ygg-watchdog молчат " + std::to_wstring(mins) + L" мин: " + g.outageWhy +
+                              L". Связь сейчас никто не сторожит. На компьютере ждёт подтверждение восстановления "
+                              L"(всплывающее окно или значок в трее → «Восстановить автопроверки…»).");
+            HKEY k;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, TRAY_SETTINGS_KEY, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+                DWORD v = (DWORD)g.lastTick;
+                RegSetValueExW(k, L"OutageForTick", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+                RegCloseKey(k);
+            }
+        }
+        Toast t; t.level = L"alert"; t.ts = now; t.action = 1;
+        t.text = L"Автопроверки молчат " + std::to_wstring(mins) + L" мин: " + g.outageWhy +
+                 L". Нажми - восстановлю задачу (Windows спросит права).";
+        bool idle = !g.toastWnd || !IsWindowVisible(g.toastWnd);
+        g.queue.insert(g.queue.begin(), t);       // впереди очереди и даже если всплывашки выключены
+        if (idle) ShowNextToast();
+    } else if (!problem && g.outage && !silent && !disabled) {
+        g.outage = false;
+        g.outageWhy.clear();
+        SendTelegramAsync(L"Автопроверки ygg-watchdog снова идут (проверка в " + HhMm(g.lastTick) + L").");
+        Toast t; t.level = L"ok"; t.ts = now;
+        t.text = L"Автопроверки снова идут.";
         EnqueueToasts({ t });
-    } else if (!stale) g.staleNotified = false;
+    }
+}
+
+void Poll() {
+    ReadState();
+    CheckOutage();
     EnqueueToasts(ReadNewEvents());
     UpdateIcon();
 }
@@ -2731,6 +2812,9 @@ void Poll() {
 LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g.taskbarCreated && g.taskbarCreated) { AddIcon(); UpdateIcon(); return 0; } // Проводник перезапустился
     switch (msg) {
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) g.awakeSince = (long long)time(nullptr);
+        return TRUE;
     case WM_TRAYICON:
         switch (LOWORD(lp)) {
         case WM_LBUTTONUP: case NIN_SELECT: case NIN_KEYSELECT: OpenMainWindow(); break;
@@ -2776,6 +2860,7 @@ int Run(HINSTANCE hInst) {
 
     // старые события не показываем - только то, что появится после запуска
     g.eventsOffset = FileSize(ExeDir() + L"events.log");
+    g.awakeSince = (long long)time(nullptr);
     ReadState();
     AddIcon();
     UpdateIcon();
