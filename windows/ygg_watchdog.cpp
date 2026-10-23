@@ -2750,7 +2750,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.3"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.4"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -2894,6 +2894,7 @@ void CheckForUpdateIfDue(WatchdogState& state) {
     state.updateLastCheckedAt = now; // отмечаем попытку независимо от результата
 
     auto info = CheckForUpdate();
+    if (!info.has_value() && g_updateCheckError.empty()) state.updateNotifiedTag.clear();   // в репозитории не новее - нечего показывать
     if (info.has_value() && state.updateNotifiedTag != info->tag) {
         state.updateNotifiedTag = info->tag;
         std::wstring msg = L"В репозитории новая версия ygg-watchdog: " + info->tag +
@@ -4638,7 +4639,8 @@ void CmdStatusJson() {
         j += L"null";
     }
     j += L",\"battery_critical_mode\":" + std::wstring(st.batteryCriticalMode ? L"true" : L"false");
-    j += L",\"update_available\":" + JStr(st.updateNotifiedTag);
+    j += L",\"update_available\":" + JStr(!st.updateNotifiedTag.empty() && !VersionLessOrEqual(st.updateNotifiedTag, CURRENT_VERSION)
+                                            ? st.updateNotifiedTag : L"");
     j += L",\"vpn_script_approved\":" + std::wstring(vpnApproved ? L"true" : L"false");
     j += L",\"telegram_configured\":" + std::wstring(notifyOn ? L"true" : L"false");
     {
@@ -5318,12 +5320,20 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         ClearVpnApproval();
     } else if (command == L"check-update") {
         auto info = CheckForUpdate();
+        if (g_updateCheckError.empty()) {   // проверка прошла - запомнить итог для окна
+            WatchdogState st = LoadState();
+            st.updateNotifiedTag = info.has_value() ? info->tag : L"";
+            st.updateLastCheckedAt = (long long)time(nullptr);
+            SaveState(st);
+        }
         if (!info.has_value() && !g_updateCheckError.empty()) {
-            Print(L"Не удалось проверить: " + g_updateCheckError + L" (текущая: " + CURRENT_VERSION + L").");
+            PrintError(L"не удалось проверить: " + g_updateCheckError + L" (у тебя " + CURRENT_VERSION + L").");
+            return 1;
         } else if (!info.has_value()) {
-            Print(L"В репозитории та же версия или старше (текущая: " + CURRENT_VERSION + L").");
+            Print(L"В репозитории та же версия или старше (у тебя " + CURRENT_VERSION + L"). "
+                  L"Если только что закоммитил - GitHub отдаёт новый файл через несколько минут.");
         } else {
-            Print(L"В репозитории новая версия: " + info->tag + L". " + info->url);
+            Print(L"В репозитории новая версия: " + info->tag + L" - можно нажать «Установить».");
         }
     } else if (command == L"apply-update") {
         std::wstring err = ApplyUpdate();
