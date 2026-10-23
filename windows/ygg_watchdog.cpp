@@ -2720,7 +2720,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.1"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.2"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -2945,24 +2945,25 @@ bool DownloadRepoFile(const std::wstring& repoPath, const std::wstring& dest, st
     return true;
 }
 
-// Применяет обновление - скачивает новый .exe из релиза GitHub и
-// подменяет СЕБЯ ЖЕ. Напрямую заменить работающий .exe на Windows
-// нельзя (файл заблокирован, пока процесс запущен), поэтому: скачиваем
-// во временный файл, самопроверка (что это непустой .exe с
-// MZ-заголовком - аналог компиляционной самопроверки с Linux, так как
-// здесь меняется готовый бинарник, а не исходники), затем короткоживущий
-// .cmd-скрипт подождёт выхода этого процесса и переименует файлы (старая
-// версия сохраняется как .backup). Потом он запускает новую версию с
-// командой selftest; если та не запустилась или упала - возвращает
-// старую и оставляет update_failed.txt, о котором сторож сообщит при
-// следующей проверке. Запускать ТОЛЬКО по явной команде.
-void ApplyUpdate() {
+// Применяет обновление: скачивает windows/ygg_watchdog.exe из репозитория,
+// сверяет git-отпечаток и запускает его с selftest (должен назвать версию из
+// исходника). Потом переименовывает текущий exe в .backup (работающий файл
+// переименовать можно) и ставит новый на его место, ещё раз проверяет уже на
+// месте - не прошёл, возвращает старый. Значок в трее перезапускается на
+// новой версии. Запускать ТОЛЬКО по явной команде.
+// Пусто - обновлено; иначе - почему нет (для окна и консоли).
+std::wstring ApplyUpdate() {
+    std::wstring lastErr;
+    auto fail = [&](const std::wstring& m) { LogError(m); lastErr = m; };
     auto info = CheckForUpdate();
     if (!info.has_value()) {
-        if (!g_updateCheckError.empty()) LogError(L"Не удалось проверить обновление: " + g_updateCheckError);
+        if (!g_updateCheckError.empty()) fail(L"Не удалось проверить обновление: " + g_updateCheckError);
         else LogInfo(L"Новых версий не найдено - обновляться не с чего.");
-        return;
+        return lastErr.empty() ? std::wstring(L"новой версии в репозитории нет") : lastErr;
     }
+
+    // скрипт замены от прежних версий мог зависнуть в ожидании - без своего файла cmd завершается сам
+    DeleteFileW((GetExeDir() + L"apply_update.cmd").c_str());
 
     wchar_t exePathBuf[MAX_PATH];
     GetModuleFileNameW(nullptr, exePathBuf, MAX_PATH);
@@ -2973,79 +2974,83 @@ void ApplyUpdate() {
     LogInfo(L"Скачиваю новую версию " + info->tag + L" из репозитория...");
     std::wstring dlErr;
     if (!DownloadRepoFile(L"windows/ygg_watchdog.exe", newPath, dlErr)) {
-        LogError(L"Не удалось скачать новую версию: " + dlErr);
-        return;
+        fail(L"Не удалось скачать новую версию: " + dlErr);
+        return lastErr;
     }
 
     if (!LooksLikeExe(newPath)) {
-        LogError(L"Скачанный файл не похож на целый .exe (нет заголовков MZ/PE) - отменяю обновление");
+        fail(L"Скачанный файл не похож на целый .exe (нет заголовков MZ/PE) - отменяю обновление");
         DeleteFileW(newPath.c_str());
-        return;
+        return lastErr;
     }
     // Самопроверка до замены: новый exe запускается, создаёт графику и называет свою версию
     std::wstring gotVer = ygg::ExeSelfTestVersion(newPath, L"selftest");
     if (gotVer != info->tag) {
-        LogError(gotVer.empty()
+        fail(gotVer.empty()
             ? L"Скачанная версия " + info->tag + L" не прошла самопроверку (не запускается) - обновление отменено."
             : L"В репозитории номер версии " + info->tag + L", а windows/ygg_watchdog.exe внутри " + gotVer +
               L" - похоже, свежую сборку забыли закоммитить. Обновление отменено.");
         DeleteFileW(newPath.c_str());
-        return;
+        return lastErr;
     }
 
-    std::wstring exeFileName = std::filesystem::path(exePath).filename().wstring();
-    std::wstring batPath = GetExeDir() + L"apply_update.cmd";
-    bool trayWasRunning = FindWindowW(L"YggWatchdogTrayMsg", nullptr) != nullptr;
-    std::wstring failPath = GetExeDir() + L"update_failed.txt";
-    std::wstring batContent =
-        L"@echo off\r\n"
-        L"chcp 65001 >nul\r\n"          // файл в UTF-8: путь с кириллицей не сломается
-        L"set /a n=0\r\n"
-        L":wait\r\n"
-        L"tasklist /FI \"IMAGENAME eq " + exeFileName + L"\" 2>NUL | find /I \"" + exeFileName + L"\" >NUL\r\n"
-        L"if errorlevel 1 goto go\r\n"
-        L"set /a n+=1\r\n"
-        // через 20 с вежливо закрываем то, что осталось (значок в трее); идущая
-        // проверка окон не имеет - её это не трогает, она доработает сама
-        L"if %n%==20 taskkill /IM " + exeFileName + L" >NUL 2>&1\r\n"
-        L"ping -n 2 127.0.0.1 >NUL\r\n"   // пауза 1 с (timeout без консоли сразу выходит с ошибкой)
-        L"goto wait\r\n"
-        L":go\r\n"
-        L"copy /Y \"" + exePath + L"\" \"" + backupPath + L"\" >NUL\r\n"
-        L"move /Y \"" + newPath + L"\" \"" + exePath + L"\" >NUL\r\n"
-        // самопроверка новой версии; не запустилась - возвращаем старую
-        L"\"" + exePath + L"\" selftest >NUL 2>&1\r\n"
-        L"if errorlevel 1 (\r\n"
-        L"  copy /Y \"" + backupPath + L"\" \"" + exePath + L"\" >NUL\r\n"
-        L"  >\"" + failPath + L"\" echo " + info->tag + L"\r\n"
-        L")\r\n"
-        // значок в трее был открыт - запускаем снова, с обычными правами (не админ)
-        + (trayWasRunning ? L"runas /trustlevel:0x20000 \"\\\"" + exePath + L"\\\" tray\"\r\n" : std::wstring()) +
-        L"del \"%~f0\"\r\n";
-
-    int size = WideCharToMultiByte(CP_UTF8, 0, batContent.c_str(), (int)batContent.size(), nullptr, 0, nullptr, nullptr);
-    std::string utf8(size, 0);
-    WideCharToMultiByte(CP_UTF8, 0, batContent.c_str(), (int)batContent.size(), &utf8[0], size, nullptr, nullptr);
-    std::ofstream bat(std::filesystem::path(batPath), std::ios::binary | std::ios::trunc);
-    bat.write(utf8.c_str(), utf8.size());
-    bat.close();
-
-    LogInfo(L"Обновление скачано и проверено. Файл будет заменён в течение нескольких секунд после "
-            L"завершения этого запуска (резервная копия текущей версии: " + backupPath + L") - "
-            L"если новая версия не пройдёт самопроверку, старая вернётся сама.");
-
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmdLine = L"cmd.exe /c \"" + batPath + L"\"";
-    std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
-    buf.push_back(L'\0');
-    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    } else {
-        LogError(L"Не удалось запустить скрипт замены файла");
+    // Работающий exe перезаписать нельзя, но переименовать можно: окно, значок
+    // в трее и идущая проверка доработают на старом файле (.backup), а всё,
+    // что запустится после, возьмёт новый. Ждать закрытия ничего не нужно
+    // (раньше скрипт ждал всех копий и вечно висел на значке в трее).
+    std::wstring bak = backupPath;
+    if (util::FileExists(bak) && !DeleteFileW(bak.c_str()))
+        bak = exePath + L".backup-" + std::to_wstring((long long)time(nullptr));   // старая копия ещё запущена - другое имя
+    if (!MoveFileExW(exePath.c_str(), bak.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DWORD e = GetLastError();
+        fail(L"Не удалось отодвинуть текущий exe в " + bak + L" (ошибка " + std::to_wstring(e) + L") - обновление отменено.");
+        DeleteFileW(newPath.c_str());
+        return lastErr;
     }
+    if (!MoveFileExW(newPath.c_str(), exePath.c_str(), 0)) {
+        DWORD e = GetLastError();
+        MoveFileExW(bak.c_str(), exePath.c_str(), 0);   // вернуть как было
+        fail(L"Не удалось поставить новый exe на место (ошибка " + std::to_wstring(e) + L") - оставлена прежняя версия.");
+        DeleteFileW(newPath.c_str());
+        return lastErr;
+    }
+    // самопроверка уже на месте; не прошла - старая возвращается
+    std::wstring placed = ygg::ExeSelfTestVersion(exePath, L"selftest");
+    if (placed != info->tag) {
+        std::wstring broken = GetExeDir() + L"ygg_watchdog.failed.exe";
+        MoveFileExW(exePath.c_str(), broken.c_str(), MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(bak.c_str(), exePath.c_str(), 0);
+        std::wstring msg = L"Обновление ygg-watchdog до " + info->tag + L" не прошло самопроверку на месте - возвращена прежняя версия " +
+                           CURRENT_VERSION + L".";
+        fail(msg);
+        Notify(L"warn", msg);
+        return lastErr;
+    }
+    LogInfo(L"Обновлено до " + info->tag + L" (прежняя версия сохранена как " + std::filesystem::path(bak).filename().wstring() + L").");
+
+    // значок в трее работает на старом файле - перезапускаем на новом
+    HWND trayWnd = FindWindowW(L"YggWatchdogTrayMsg", nullptr);
+    if (trayWnd) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(trayWnd, &pid);
+        HANDLE hp = pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr;
+        PostMessageW(trayWnd, WM_CLOSE, 0, 0);   // штатно: значок убирается из трея
+        if (hp) {
+            if (WaitForSingleObject(hp, 5000) != WAIT_OBJECT_0) TerminateProcess(hp, 0);
+            CloseHandle(hp);
+        }
+        // с обычными правами (не админ), как его запускает автозагрузка
+        std::wstring cmd = L"runas.exe /trustlevel:0x20000 \"\\\"" + exePath + L"\\\" tray\"";
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+        buf.push_back(L'\0');
+        if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else LogError(L"Не удалось перезапустить значок в трее - открой ygg_watchdog.exe, он появится сам.");
+    }
+    return L"";
 }
 
 // ------------------------------------------------------------------
@@ -5291,7 +5296,9 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
             Print(L"В репозитории новая версия: " + info->tag + L". " + info->url);
         }
     } else if (command == L"apply-update") {
-        ApplyUpdate();
+        std::wstring err = ApplyUpdate();
+        if (!err.empty()) { PrintError(err); return 1; }
+        Print(L"Обновлено.");
     } else if (command == L"test-notify") {
         // Для кнопки «Проверить» в окне: notify.conf пишет само окно,
         // токен через командную строку не передаётся.

@@ -2062,10 +2062,9 @@ struct App {
             break;
         case BTN_UPD_CHECK: RunCmd(L"проверяю обновления", L"check-update"); break;
         case BTN_UPD_APPLY:
-            Confirm(L"Скачать и установить новую версию ygg-watchdog с GitHub? Старая сохранится как ygg_watchdog.exe.backup. "
-                    L"Файл заменится, когда окно будет закрыто.",
+            Confirm(L"Скачать и установить новую версию ygg-watchdog с GitHub? Старая сохранится как ygg_watchdog.exe.backup.",
                     L"УСТАНОВИТЬ", [this] { RunCmd(L"обновляюсь", L"apply-update", CMD_GENERIC, 300000,
-                                                  L"Обновление скачано. Закрой окно - файл заменится, потом открой снова."); });
+                                                  L"Обновлено. Закрой и открой окно - оно пока работает на прежней версии."); });
             break;
         case BTN_VPN_PICK: {
             std::wstring path;
