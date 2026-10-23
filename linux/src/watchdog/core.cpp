@@ -95,6 +95,19 @@ struct NotifyConfig {
     std::vector<std::string> proxyClients;
     bool valid = false;
 };
+// Токен и chat_id часто копируются с мусором: неразрывный пробел и невидимые
+// символы из Telegram, "bot" из ссылки api.telegram.org/bot<токен>, угловые скобки.
+std::string CleanTelegramValue(const std::string& v, bool token) {
+    static const char* junk[] = { "\xC2\xA0", "\xEF\xBB\xBF", "\xE2\x81\xA0", "\xE2\x80\x8B", "\xE2\x80\x8C", "\xE2\x80\x8D",
+                                  "\xE2\x80\x8E", "\xE2\x80\x8F", " ", "\t", "\r", "\n", "<", ">", "\"", "'" };
+    std::string out = v;
+    for (const char* j : junk) {
+        std::string jj = j;
+        for (size_t p; (p = out.find(jj)) != std::string::npos;) out.erase(p, jj.size());
+    }
+    if (token && out.size() > 3 && util::Lower(out.substr(0, 3)) == "bot" && isdigit((unsigned char)out[3])) out.erase(0, 3);
+    return out;
+}
 NotifyConfig LoadNotifyConfig() {
     NotifyConfig c;
     std::string text = util::ReadFile(NotifyPath());
@@ -106,8 +119,8 @@ NotifyConfig LoadNotifyConfig() {
         if (eq == std::string::npos) continue;
         std::string k = util::Trim(line.substr(0, eq)), v = util::Trim(line.substr(eq + 1));
         if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0]) v = util::Trim(v.substr(1, v.size() - 2));   // в кавычках
-        if (k == "BOT_TOKEN") c.botToken = v;
-        else if (k == "CHAT_ID") c.chatId = v;
+        if (k == "BOT_TOKEN") c.botToken = CleanTelegramValue(v, true);
+        else if (k == "CHAT_ID") c.chatId = CleanTelegramValue(v, false);
         else if (k == "PROXY") c.proxy = v;
         else if (k == "PROXY_CLIENTS") for (const auto& x : util::Split(v, ',')) c.proxyClients.push_back(util::Trim(x));
     }

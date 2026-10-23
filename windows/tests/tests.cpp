@@ -260,6 +260,13 @@ static void TestNotifyConf() {
     Check(!c.problem.empty(), L"токен без двоеточия - подсказка");
     c = ConfFrom("BOT_TOKEN=123:abc\nCHAT_ID=моё\n");
     Check(!c.problem.empty(), L"chat_id не число - подсказка");
+    c = ConfFrom("BOT_TOKEN=\xC2\xA0" "123:ab\xE2\x80\x8B" "c\xC2\xA0\nCHAT_ID=5\xC2\xA0\n");
+    Check(c.problem.empty(), L"неразрывный пробел и невидимый символ вычищаются");
+    Eq(c.botToken, L"123:abc", L"токен после чистки");
+    c = ConfFrom("BOT_TOKEN=bot123:abc\nCHAT_ID=5\n");
+    Eq(c.botToken, L"123:abc", L"bot из ссылки убирается");
+    c = ConfFrom("BOT_TOKEN=123:ab\xC3\xA9" "c\nCHAT_ID=5\n");
+    Check(c.problem.find(L"на месте 7") != std::wstring::npos, L"лишний символ назван с местом");
     c = ConfFrom("# BOT_TOKEN=123:abc\nCHAT_ID=5\n");
     Check(!c.valid, L"закомментированный токен - не настроен");
 }

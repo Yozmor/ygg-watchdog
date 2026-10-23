@@ -36,6 +36,8 @@
 
 // Из ygg_watchdog.cpp (тот же exe): отправка в Telegram по notify.conf
 bool SendTelegramNotification(const std::wstring& message);
+std::wstring CleanTelegramValue(const std::wstring& v, bool token);
+std::wstring TelegramTokenProblem(const std::wstring& t);
 
 namespace gui {
 using namespace ui;
@@ -2111,7 +2113,7 @@ struct App {
     // Telegram = отключить (после подтверждения). Прочие строки (PROXY,
     // комментарии) сохраняются.
     void SaveTelegram() {
-        std::wstring token = tbTgToken.Trimmed(), chat = tbTgChat.Trimmed();
+        std::wstring token = CleanTelegramValue(tbTgToken.Trimmed(), true), chat = CleanTelegramValue(tbTgChat.Trimmed(), false);
         bool configured = snap.status[L"telegram_configured"].boolean();
         if (token.empty() && chat.empty()) {
             if (!configured) return;
@@ -2119,8 +2121,9 @@ struct App {
                     [this] { WriteNotifyConf(L"", L"", true); });
             return;
         }
-        if (!token.empty() && token.find(L':') == std::wstring::npos) {
-            Flash(L"Токен бота выглядит как 123456:ABC… - проверь, что скопирован целиком", COL_ALERT); return;
+        if (!token.empty()) {
+            std::wstring tp = TelegramTokenProblem(token);
+            if (!tp.empty()) { Flash(tp, COL_ALERT); return; }
         }
         if (!chat.empty()) {
             size_t i = chat[0] == L'-' ? 1 : 0;
@@ -2145,8 +2148,8 @@ struct App {
             size_t eq = (t.empty() || t[0] == L'#') ? std::wstring::npos : t.find(L'=');
             std::wstring key = eq == std::wstring::npos ? L"" : util::Trim(t.substr(0, eq));
             std::wstring val = eq == std::wstring::npos ? L"" : util::Trim(t.substr(eq + 1));
-            if (key == L"BOT_TOKEN") keepToken = val;
-            else if (key == L"CHAT_ID") keepChat = val;
+            if (key == L"BOT_TOKEN") keepToken = CleanTelegramValue(val, true);
+            else if (key == L"CHAT_ID") keepChat = CleanTelegramValue(val, false);
             else if (!t.empty()) rest += ln + L"\r\n";
         }
         std::wstring t = clearBoth ? L"" : (token.empty() ? keepToken : token);

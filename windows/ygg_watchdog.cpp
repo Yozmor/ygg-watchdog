@@ -553,6 +553,42 @@ struct NotifyConfig {
     bool proxySocks = false;    // в PROXY= вписан socks5://... - WinHTTP так не умеет, путь пропускается
 };
 
+// Токен и chat_id часто копируются с мусором: неразрывный пробел или
+// невидимые символы из Telegram, "bot" из ссылки api.telegram.org/bot<токен>,
+// угловые скобки из инструкции. Всё это убирается.
+std::wstring CleanTelegramValue(const std::wstring& v, bool token) {
+    std::wstring out;
+    for (wchar_t c : v) {
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x00A0 || c == 0xFEFF || c == 0x2060 ||
+            (c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E) || c == L'<' || c == L'>' || c == L'"' || c == L'\'')
+            continue;
+        out += c;
+    }
+    if (token && out.size() > 3 && util::Lower(out.substr(0, 3)) == L"bot" && iswdigit(out[3])) out.erase(0, 3);
+    return out;
+}
+
+// Что не так с токеном (пусто - похож на настоящий): 123456789:AAH... - цифры, двоеточие, латиница/цифры/_/-
+std::wstring TelegramTokenProblem(const std::wstring& t) {
+    size_t colon = t.find(L':');
+    if (colon == std::wstring::npos) return L"в BOT_TOKEN нет двоеточия - скопирован не целиком? Нужен вид 123456789:AAH...";
+    if (colon == 0) return L"в BOT_TOKEN нет цифр перед двоеточием - нужен вид 123456789:AAH...";
+    if (colon + 1 >= t.size()) return L"в BOT_TOKEN пусто после двоеточия - скопирован не целиком";
+    for (size_t i = 0; i < t.size(); ++i) {
+        wchar_t c = t[i];
+        bool ok = i < colon ? (c >= L'0' && c <= L'9')
+                            : ((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'_' || c == L'-');
+        if (i == colon) ok = true;
+        if (!ok) {
+            wchar_t hex[8];
+            swprintf(hex, 8, L"%04X", (unsigned)c);
+            return L"в BOT_TOKEN лишний символ «" + std::wstring(1, c) + L"» (U+" + hex + L") на месте " + std::to_wstring(i + 1) +
+                   L" - впиши токен заново в окне («Управление» → новый токен бота)";
+        }
+    }
+    return L"";
+}
+
 NotifyConfig LoadNotifyConfig() {
     NotifyConfig config;
     std::wstring text = ReadFileUtf8(GetExeDir() + L"notify.conf");
@@ -568,8 +604,8 @@ NotifyConfig LoadNotifyConfig() {
         std::wstring value = util::Trim(line.substr(eq + 1));
         if (value.size() >= 2 && (value.front() == L'"' || value.front() == L'\'') && value.back() == value.front())
             value = util::Trim(value.substr(1, value.size() - 2));   // значение в кавычках
-        if (key == L"BOT_TOKEN") config.botToken = value;
-        else if (key == L"CHAT_ID") config.chatId = value;
+        if (key == L"BOT_TOKEN") config.botToken = CleanTelegramValue(value, true);
+        else if (key == L"CHAT_ID") config.chatId = CleanTelegramValue(value, false);
         else if (key == L"PROXY") {
             size_t p = value.find(L"://");   // http://127.0.0.1:2080 -> 127.0.0.1:2080
             if (p != std::wstring::npos) {
@@ -583,18 +619,12 @@ NotifyConfig LoadNotifyConfig() {
     }
     config.valid = !config.botToken.empty() && !config.chatId.empty();
     if (config.valid) {
-        // токен: 123456:ABC-DEF... (цифры, двоеточие, без пробелов); chat_id: число (у групп с минусом) или @канал
-        size_t colon = config.botToken.find(L':');
-        bool tokenOk = colon != std::wstring::npos && colon > 0 && colon + 1 < config.botToken.size();
-        for (size_t i = 0; tokenOk && i < config.botToken.size(); ++i) {
-            wchar_t c = config.botToken[i];
-            if (i < colon ? !iswdigit(c) : !((c < 128 && iswalnum(c)) || c == L'_' || c == L'-' || c == L':')) tokenOk = false;
-        }
         bool chatOk = !config.chatId.empty();
         if (chatOk && config.chatId[0] == L'@') chatOk = config.chatId.size() > 1;
         else for (size_t i = 0; chatOk && i < config.chatId.size(); ++i)
             if (!(iswdigit(config.chatId[i]) || (i == 0 && config.chatId[i] == L'-'))) chatOk = false;
-        if (!tokenOk) config.problem = L"BOT_TOKEN в notify.conf выглядит неправильно: нужен вид 123456789:AAH... без пробелов и лишних символов";
+        std::wstring tp = TelegramTokenProblem(config.botToken);
+        if (!tp.empty()) config.problem = tp;
         else if (!chatOk) config.problem = L"CHAT_ID в notify.conf выглядит неправильно: нужно число из getUpdates (у групп с минусом впереди)";
     }
     return config;
@@ -2720,7 +2750,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.2"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.3"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
