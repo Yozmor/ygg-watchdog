@@ -549,26 +549,54 @@ struct NotifyConfig {
                                  // пользователя)
     std::wstring proxyClients;  // PROXY_CLIENTS - свои VPN-клиенты для автопоиска (части имени exe через запятую)
     bool valid = false; // именно для Telegram - нужны оба BOT_TOKEN/CHAT_ID
+    std::wstring problem;       // токен или chat_id заполнены, но выглядят неправильно - что не так
+    bool proxySocks = false;    // в PROXY= вписан socks5://... - WinHTTP так не умеет, путь пропускается
 };
 
 NotifyConfig LoadNotifyConfig() {
     NotifyConfig config;
     std::wstring text = ReadFileUtf8(GetExeDir() + L"notify.conf");
+    if (!text.empty() && text[0] == 0xFEFF) text.erase(0, 1);   // метка BOM от Блокнота
     if (text.empty()) return config;
 
     for (auto line : SplitBy(text, L'\n')) {
-        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        line = util::Trim(line);   // пробелы и \r по краям, отступы
         if (line.empty() || line[0] == L'#') continue;
         size_t eq = line.find(L'=');
         if (eq == std::wstring::npos) continue;
-        std::wstring key = line.substr(0, eq);
-        std::wstring value = line.substr(eq + 1);
+        std::wstring key = util::Trim(line.substr(0, eq));   // "BOT_TOKEN = ..." тоже годится
+        std::wstring value = util::Trim(line.substr(eq + 1));
+        if (value.size() >= 2 && (value.front() == L'"' || value.front() == L'\'') && value.back() == value.front())
+            value = util::Trim(value.substr(1, value.size() - 2));   // значение в кавычках
         if (key == L"BOT_TOKEN") config.botToken = value;
         else if (key == L"CHAT_ID") config.chatId = value;
-        else if (key == L"PROXY") config.proxyOverride = util::Trim(value);
+        else if (key == L"PROXY") {
+            size_t p = value.find(L"://");   // http://127.0.0.1:2080 -> 127.0.0.1:2080
+            if (p != std::wstring::npos) {
+                if (util::Lower(value.substr(0, p)).rfind(L"socks", 0) == 0) config.proxySocks = true;
+                value = value.substr(p + 3);
+            }
+            while (!value.empty() && value.back() == L'/') value.pop_back();
+            config.proxyOverride = config.proxySocks ? L"" : value;   // SOCKS WinHTTP не умеет - такой путь пропускается
+        }
         else if (key == L"PROXY_CLIENTS") config.proxyClients = value;
     }
     config.valid = !config.botToken.empty() && !config.chatId.empty();
+    if (config.valid) {
+        // токен: 123456:ABC-DEF... (цифры, двоеточие, без пробелов); chat_id: число (у групп с минусом) или @канал
+        size_t colon = config.botToken.find(L':');
+        bool tokenOk = colon != std::wstring::npos && colon > 0 && colon + 1 < config.botToken.size();
+        for (size_t i = 0; tokenOk && i < config.botToken.size(); ++i) {
+            wchar_t c = config.botToken[i];
+            if (i < colon ? !iswdigit(c) : !((c < 128 && iswalnum(c)) || c == L'_' || c == L'-' || c == L':')) tokenOk = false;
+        }
+        bool chatOk = !config.chatId.empty();
+        if (chatOk && config.chatId[0] == L'@') chatOk = config.chatId.size() > 1;
+        else for (size_t i = 0; chatOk && i < config.chatId.size(); ++i)
+            if (!(iswdigit(config.chatId[i]) || (i == 0 && config.chatId[i] == L'-'))) chatOk = false;
+        if (!tokenOk) config.problem = L"BOT_TOKEN в notify.conf выглядит неправильно: нужен вид 123456789:AAH... без пробелов и лишних символов";
+        else if (!chatOk) config.problem = L"CHAT_ID в notify.conf выглядит неправильно: нужно число из getUpdates (у групп с минусом впереди)";
+    }
     return config;
 }
 
@@ -707,11 +735,11 @@ std::vector<std::wstring> ProxyClientNames() {
     return v;
 }
 
-// Пускает ли HTTP-прокси на 127.0.0.1:port к host:443 (ответ "HTTP/1.x 200" на CONNECT)
-bool TestHttpConnectProxy(unsigned short port, const std::wstring& host) {
+// TCP-подключение к 127.0.0.1:port за 1 с, дальше блокирующий сокет с тайм-аутом 6 с
+SOCKET ConnectLoopback(unsigned short port) {
     static util::WsaInit wsa;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return false;
+    if (s == INVALID_SOCKET) return s;
     sockaddr_in a = {};
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
@@ -721,37 +749,81 @@ bool TestHttpConnectProxy(unsigned short port, const std::wstring& host) {
     connect(s, (sockaddr*)&a, sizeof(a));
     fd_set w; FD_ZERO(&w); FD_SET(s, &w);
     timeval tv = { 1, 0 };
+    if (select(0, nullptr, &w, nullptr, &tv) <= 0) { closesocket(s); return INVALID_SOCKET; }
+    nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    DWORD to = 6000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+    return s;
+}
+
+// Пускает ли HTTP-прокси на 127.0.0.1:port к host:443 (ответ "HTTP/1.x 200" на CONNECT)
+bool TestHttpConnectProxy(unsigned short port, const std::wstring& host) {
+    SOCKET s = ConnectLoopback(port);
+    if (s == INVALID_SOCKET) return false;
     bool ok = false;
-    if (select(0, nullptr, &w, nullptr, &tv) > 0) {
-        nb = 0;
-        ioctlsocket(s, FIONBIO, &nb);
-        DWORD to = 6000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
-        std::string h = util::ToUtf8(host);
-        std::string req = "CONNECT " + h + ":443 HTTP/1.1\r\nHost: " + h + ":443\r\n\r\n";
-        if (send(s, req.data(), (int)req.size(), 0) == (int)req.size()) {
-            char buf[256];
-            int n = recv(s, buf, sizeof(buf) - 1, 0);
-            if (n >= 12) {
-                buf[n] = 0;
-                std::string resp(buf, n);
-                ok = resp.compare(0, 7, "HTTP/1.") == 0 && resp.compare(9, 3, "200") == 0;
-            }
+    std::string h = util::ToUtf8(host);
+    std::string req = "CONNECT " + h + ":443 HTTP/1.1\r\nHost: " + h + ":443\r\n\r\n";
+    if (send(s, req.data(), (int)req.size(), 0) == (int)req.size()) {
+        char buf[256];
+        int n = recv(s, buf, sizeof(buf) - 1, 0);
+        if (n >= 12) {
+            buf[n] = 0;
+            std::string resp(buf, n);
+            ok = resp.compare(0, 7, "HTTP/1.") == 0 && resp.compare(9, 3, "200") == 0;
         }
     }
     closesocket(s);
     return ok;
 }
 
+// Порт - SOCKS5? (на приветствие 05 01 00 отвечает 05 xx) - только чтобы подсказать человеку
+bool LooksLikeSocks5(unsigned short port) {
+    SOCKET s = ConnectLoopback(port);
+    if (s == INVALID_SOCKET) return false;
+    const char hello[3] = { 5, 1, 0 };
+    bool yes = false;
+    if (send(s, hello, 3, 0) == 3) {
+        char buf[8];
+        int n = recv(s, buf, sizeof(buf), 0);
+        yes = n >= 2 && buf[0] == 5;
+    }
+    closesocket(s);
+    return yes;
+}
+
+// Ход перебора путей последнего запроса - для test-notify и строки «НЕ ушло» в окне
+std::vector<std::wstring> g_routeTrace;
+
+std::wstring WinHttpErrText(DWORD e) {
+    switch (e) {
+    case 12002: return L"тайм-аут (похоже на блокировку)";
+    case 12007: return L"имя сайта не находится (DNS)";
+    case 12029: return L"не подключиться";
+    case 12030: return L"соединение оборвано";
+    case 12152: return L"непонятный ответ сервера";
+    case 12157: case 12175: return L"ошибка TLS (защищённое соединение не установилось)";
+    case 12180: return L"автонастройка прокси не нашлась";
+    case ERROR_NOT_FOUND: return L"не задан";
+    default: return L"ошибка WinHTTP " + std::to_wstring(e);
+    }
+}
+
+struct ProxyScan { std::vector<HttpRoute> routes; std::vector<std::wstring> notes; };
+
 // Автопоиск: известные VPN-клиенты, слушающие 127.0.0.1 / 0.0.0.0, чей порт пускает к host
-std::vector<HttpRoute> ScanLocalProxies(const std::wstring& host) {
-    std::vector<HttpRoute> out;
+ProxyScan ScanLocalProxies(const std::wstring& host) {
+    ProxyScan res;
+    std::vector<HttpRoute>& out = res.routes;
     DWORD size = 0;
     GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
     std::vector<BYTE> buf(size + 4096);
     size = (DWORD)buf.size();
-    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) return out;
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) {
+        res.notes.push_back(L"автопоиск: не удалось прочитать список портов");
+        return res;
+    }
     auto* t = (MIB_TCPTABLE_OWNER_PID*)buf.data();
     auto names = ProxyClientNames();
     std::map<DWORD, std::wstring> procName;
@@ -777,13 +849,22 @@ std::vector<HttpRoute> ScanLocalProxies(const std::wstring& host) {
         for (const auto& k : names) if (!k.empty() && low.find(k) != std::wstring::npos) { known = true; break; }
         if (!known) continue;
         tried.insert(port);
-        if (TestHttpConnectProxy(port, host)) {
-            std::wstring a = L"127.0.0.1:" + std::to_wstring(port);
-            std::wstring clean = pn.size() > 4 && util::Lower(pn.substr(pn.size() - 4)) == L".exe" ? pn.substr(0, pn.size() - 4) : pn;
-            out.push_back({ L"proxy", a, clean + L" (" + a + L")" });
-        }
+        std::wstring a = L"127.0.0.1:" + std::to_wstring(port);
+        std::wstring clean = pn.size() > 4 && util::Lower(pn.substr(pn.size() - 4)) == L".exe" ? pn.substr(0, pn.size() - 4) : pn;
+        if (TestHttpConnectProxy(port, host)) out.push_back({ L"proxy", a, clean + L" (" + a + L")" });
+        else if (LooksLikeSocks5(port)) res.notes.push_back(clean + L" (" + a + L") - SOCKS-порт, а нужен HTTP или mixed");
+        else res.notes.push_back(clean + L" (" + a + L") - не пустил к " + host);
     }
-    return out;
+    if (tried.empty()) res.notes.push_back(L"автопоиск: известные VPN-клиенты не слушают порты на 127.0.0.1");
+    return res;
+}
+
+// Дошли ли до самого сайта, а не до ошибки прокси по дороге
+bool ReachedSite(const std::wstring& host, const HttpResult& r) {
+    if (!r.transportOk) return false;
+    if (r.status == 407 || r.status == 502 || r.status == 503 || r.status == 504) return false;   // так отвечает прокси, у которого нет выхода
+    if (util::Lower(host) == L"api.telegram.org") return r.body.find("\"ok\"") != std::string::npos;   // Telegram всегда отвечает JSON с "ok"
+    return true;
 }
 
 // Сам запрос: маршруты по очереди. allowProxies=false - только напрямую
@@ -791,6 +872,7 @@ std::vector<HttpRoute> ScanLocalProxies(const std::wstring& host) {
 HttpResult HttpRequest(const wchar_t* method, const std::wstring& host, const std::wstring& path, const std::wstring& headers,
                        const std::string* body, const BodySink& sink = nullptr, DWORD recvTimeoutMs = 30000,
                        bool allowProxies = true, const std::function<void()>& beforeRetry = nullptr) {
+    g_routeTrace.clear();
     std::vector<HttpRoute> routes;
     auto add = [&](const HttpRoute& r) {
         for (const auto& x : routes) if (x.kind == r.kind && x.proxy == r.proxy) return;
@@ -800,7 +882,9 @@ HttpResult HttpRequest(const wchar_t* method, const std::wstring& host, const st
     HttpRoute cached;
     if (allowProxies && RouteFromText(util::RegReadPath(REG_WATCHDOG_KEY, cacheKey.c_str()), cached)) add(cached);
     if (allowProxies) {
-        std::wstring px = LoadNotifyConfig().proxyOverride;
+        NotifyConfig nc = LoadNotifyConfig();
+        std::wstring px = nc.proxyOverride;
+        if (nc.proxySocks) g_routeTrace.push_back(L"PROXY из notify.conf - SOCKS, пропущен: нужен HTTP-порт (http или mixed)");
         if (!px.empty()) add({ L"proxy", px, L"PROXY из notify.conf (" + px + L")" });
         for (const auto& h : ProxyHints()) add({ L"proxy", h, L"прокси, указанный клиентом (" + h + L")" });
     }
@@ -808,27 +892,46 @@ HttpResult HttpRequest(const wchar_t* method, const std::wstring& host, const st
     if (allowProxies) add({ L"ie", L"", L"системный прокси" });
 
     HttpResult last;
+    std::set<std::wstring> triedRoutes;
     auto attempt = [&](const HttpRoute& rt) {
+        if (!triedRoutes.insert(rt.kind + L"|" + rt.proxy).second) return false;   // автопоиск нашёл уже проверенный порт
         if (beforeRetry) beforeRetry();
         HttpResult r = HttpOnce(rt, method, host, path, headers, body, sink, recvTimeoutMs);
-        if (r.transportOk) {
+        if (ReachedSite(host, r)) {
             if (allowProxies && RouteToText(rt) != RouteToText(cached))
                 util::RegWriteString(REG_WATCHDOG_KEY, cacheKey.c_str(), RouteToText(rt));   // без прав (трей) - молча не запишется
+            g_routeTrace.push_back(rt.label + L" - дошло");
             last = r;
             return true;
         }
-        if (r.winErr != ERROR_NOT_FOUND) last = r;
+        if (r.transportOk) {
+            // ответ есть, но не от сайта: прокси без выхода в интернет и т.п. - пробуем дальше
+            g_routeTrace.push_back(rt.label + L" - ответ HTTP " + std::to_wstring(r.status) + L" не от " + host + L" (прокси без выхода?)");
+            if (!last.transportOk) last = r;
+        } else {
+            g_routeTrace.push_back(rt.label + L" - " + WinHttpErrText(r.winErr));
+            if (r.winErr != ERROR_NOT_FOUND && !last.transportOk) last = r;
+        }
         return false;
     };
     for (const auto& rt : routes) if (attempt(rt)) return last;
     if (allowProxies) {
         // автопоиск - один раз на сайт за запуск программы (сканирование портов не бесплатное)
-        static std::map<std::wstring, std::vector<HttpRoute>> scanned;
+        static std::map<std::wstring, ProxyScan> scanned;
         std::wstring key = util::Lower(host);
         if (!scanned.count(key)) scanned[key] = ScanLocalProxies(host);
-        for (const auto& rt : scanned[key]) if (attempt(rt)) return last;
+        for (const auto& n : scanned[key].notes) g_routeTrace.push_back(n);
+        for (const auto& rt : scanned[key].routes) if (attempt(rt)) return last;
     }
+    // ни один путь не дошёл до сайта: ответ прокси без выхода - не успех
+    if (last.transportOk && !ReachedSite(host, last)) { last.transportOk = false; last.winErr = 0; }
     return last;
+}
+
+std::wstring RouteTraceText() {
+    std::wstring t;
+    for (const auto& x : g_routeTrace) { if (!t.empty()) t += L"; "; t += x; }
+    return t;
 }
 
 DWORD g_lastHttpStatus = 0;   // код ответа последнего HttpGetUtf8 (0 - не дошёл)
@@ -837,7 +940,7 @@ std::string HttpGetUtf8(const std::wstring& host, const std::wstring& path, bool
     HttpResult r = HttpRequest(L"GET", host, path, L"", nullptr, nullptr, 30000, allowProxies);
     g_lastHttpStatus = r.status;
     if (!r.transportOk) {
-        LogError(L"HTTP-запрос не удался (WinHTTP " + std::to_wstring(r.winErr) + L"): " + host + path);
+        LogError(L"HTTP-запрос не удался: " + host + path + L" - " + RouteTraceText());
         return "";
     }
     if (r.status == 404) { LogDebug(L"HTTP 404 от " + host + path); return ""; }
@@ -1177,17 +1280,25 @@ struct WatchdogState {
 // POST (Telegram). err - почему не вышло, via - каким маршрутом ушло.
 bool HttpPostUtf8(const std::wstring& host, const std::wstring& path, const std::string& body,
                   std::wstring* err = nullptr, std::wstring* via = nullptr) {
-    HttpResult r = HttpRequest(L"POST", host, path, L"Content-Type: application/x-www-form-urlencoded\r\n", &body);
+    // ответ на маленький POST приходит быстро: 15 с хватает, а висящий путь не съедает всю проверку
+    HttpResult r = HttpRequest(L"POST", host, path, L"Content-Type: application/x-www-form-urlencoded\r\n", &body, nullptr, 15000);
     if (via) *via = r.via;
     if (!r.transportOk) {
-        if (err) *err = L"не достучался до " + host + L" ни напрямую, ни через прокси (WinHTTP " + std::to_wstring(r.winErr) + L")";
+        if (err) *err = L"не достучался до " + host + L": " + RouteTraceText();
         return false;
     }
     if (r.status == 200) return true;
     if (err) {
         json::Value v;
         std::wstring desc = json::Parse(r.body, v) ? v[L"description"].str() : L"";
-        *err = L"сервер ответил HTTP " + std::to_wstring(r.status) + (desc.empty() ? L"" : L": " + desc);
+        *err = L"сервер ответил HTTP " + std::to_wstring(r.status) + (desc.empty() ? L"" : L": " + desc) + L" (через " + r.via + L")";
+        if (util::Lower(host) == L"api.telegram.org") {
+            std::wstring d = util::Lower(desc);
+            if (r.status == 401 || r.status == 404) *err += L" - неверный BOT_TOKEN: скопируй заново у @BotFather";
+            else if (d.find(L"chat not found") != std::wstring::npos) *err += L" - неверный CHAT_ID или ты ещё не написал боту";
+            else if (r.status == 403) *err += L" - бот заблокирован или с ним не начат диалог: открой бота и нажми «Старт»";
+            else if (r.status == 429) *err += L" - слишком много сообщений, Telegram просит подождать";
+        }
     }
     return false;
 }
@@ -1233,6 +1344,16 @@ std::wstring g_telegramLastVia, g_telegramLastErr;   // для test-notify
 bool SendTelegramNotification(const std::wstring& message) {
     NotifyConfig config = LoadNotifyConfig();
     if (!config.valid) return false;
+    if (!config.problem.empty()) {
+        g_telegramLastVia.clear();
+        g_telegramLastErr = config.problem;
+        util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastAt", std::to_wstring((long long)time(nullptr)));
+        util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastOk", L"0");
+        util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastVia", L"");
+        util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastErr", config.problem);
+        LogError(L"Telegram: сообщение не отправлено - " + config.problem);
+        return false;
+    }
 
     std::wstring fullMessage = L"[" + GetDeviceName() + L"] " + message;
     std::string body = "chat_id=" + UrlEncodeUtf8(config.chatId) +
@@ -2599,7 +2720,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.0"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.1"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -5179,11 +5300,18 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
             PrintError(L"Telegram не настроен: в notify.conf нет BOT_TOKEN или CHAT_ID.");
             return 1;
         }
-        if (SendTelegramNotification(L"Проверка связи: уведомления ygg-watchdog работают.")) {
+        bool sent = SendTelegramNotification(L"Проверка связи: уведомления ygg-watchdog работают.");
+        if (config.problem.empty()) {
+            Print(L"Пути до Telegram по очереди:");
+            for (const auto& t : g_routeTrace) Print(L"  " + t);
+        }
+        if (sent) {
             Print(L"Тестовое сообщение отправлено в Telegram (" + g_telegramLastVia + L").");
         } else {
-            PrintError(L"не отправилось: " + g_telegramLastErr + L". Если дело в доступе - нужен VPN: в TUN-режиме "
-                       L"или с локальным HTTP-прокси (сторож найдёт его сам; свой клиент - PROXY_CLIENTS в notify.conf).");
+            bool access = g_telegramLastErr.rfind(L"не достучался", 0) == 0;
+            PrintError(L"не отправилось: " + g_telegramLastErr +
+                       (access ? L". Нужен VPN: в TUN-режиме или с локальным HTTP-прокси (порт http или mixed; сторож найдёт его сам, "
+                                 L"или впиши PROXY=127.0.0.1:порт в notify.conf)." : L""));
             return 1;
         }
     } else {

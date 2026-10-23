@@ -165,7 +165,10 @@ int main(int argc, char** argv) {
     if (cmd == "test-notify") {
         NotifyConfig c = LoadNotifyConfig();
         if (!c.valid) { PrintError("Telegram не настроен: в notify.conf нет BOT_TOKEN или CHAT_ID."); return 1; }
-        if (SendTelegram("Тестовое сообщение от ygg-watchdog - уведомления работают.")) { Print("Отправлено (" + g_tgLastVia + ")."); return 0; }
+        bool sent = SendTelegram("Тестовое сообщение от ygg-watchdog - уведомления работают.");
+        Print("Пути до Telegram по очереди:");
+        for (const auto& t : net::Trace()) Print("  " + t);
+        if (sent) { Print("Отправлено (" + g_tgLastVia + ")."); return 0; }
         PrintError("не отправлено: " + g_tgLastErr);
         return 1;
     }

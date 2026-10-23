@@ -97,11 +97,15 @@ struct NotifyConfig {
 };
 NotifyConfig LoadNotifyConfig() {
     NotifyConfig c;
-    for (const auto& line : util::Lines(util::ReadFile(NotifyPath()))) {
+    std::string text = util::ReadFile(NotifyPath());
+    if (util::StartsWith(text, "\xEF\xBB\xBF")) text.erase(0, 3);   // метка BOM
+    for (const auto& raw : util::Lines(text)) {
+        std::string line = util::Trim(raw);
         if (line.empty() || line[0] == '#') continue;
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string k = util::Trim(line.substr(0, eq)), v = util::Trim(line.substr(eq + 1));
+        if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0]) v = util::Trim(v.substr(1, v.size() - 2));   // в кавычках
         if (k == "BOT_TOKEN") c.botToken = v;
         else if (k == "CHAT_ID") c.chatId = v;
         else if (k == "PROXY") c.proxy = v;
@@ -129,11 +133,16 @@ bool SendTelegram(const std::string& message) {
                                      "Content-Type: application/x-www-form-urlencoded\r\n", &body);
     bool ok = r.transportOk && r.status == 200;
     std::string err;
-    if (!r.transportOk) err = "не достучался до api.telegram.org ни напрямую, ни через прокси (" + r.err + ")";
+    if (!r.transportOk) err = "не достучался до api.telegram.org: " + net::TraceText();
     else if (!ok) {
         json::Value v;
         std::string desc = json::Parse(r.body, v) ? v["description"].str() : "";
-        err = "сервер ответил HTTP " + std::to_string(r.status) + (desc.empty() ? "" : ": " + desc);
+        err = "сервер ответил HTTP " + std::to_string(r.status) + (desc.empty() ? "" : ": " + desc) + " (через " + r.via + ")";
+        std::string d = util::Lower(desc);
+        if (r.status == 401 || r.status == 404) err += " - неверный BOT_TOKEN: скопируй заново у @BotFather";
+        else if (util::Contains(d, "chat not found")) err += " - неверный CHAT_ID или ты ещё не написал боту";
+        else if (r.status == 403) err += " - бот заблокирован или с ним не начат диалог: открой бота и нажми «Старт»";
+        else if (r.status == 429) err += " - слишком много сообщений, Telegram просит подождать";
     }
     g_tgLastVia = ok ? r.via : "";
     g_tgLastErr = err;

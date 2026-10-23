@@ -18,6 +18,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -454,12 +455,28 @@ struct RequestOpts {
     size_t maxBody = 64 * 1024 * 1024;
 };
 
+// Ход перебора путей последнего запроса в этом потоке - для test-notify и текста ошибки
+inline std::vector<std::string>& Trace() { thread_local std::vector<std::string> t; return t; }
+inline std::string TraceText() {
+    std::string s;
+    for (const auto& x : Trace()) { if (!s.empty()) s += "; "; s += x; }
+    return s;
+}
+// Дошли ли до самого сайта, а не до ошибки прокси по дороге
+inline bool ReachedSite(const std::string& host, const HttpResult& r) {
+    if (!r.transportOk) return false;
+    if (r.status == 407 || r.status == 502 || r.status == 503 || r.status == 504) return false;   // так отвечает прокси без выхода
+    if (util::Lower(host) == "api.telegram.org") return util::Contains(r.body, "\"ok\"");   // Telegram всегда отвечает JSON с "ok"
+    return true;
+}
+
 // Запрос по URL с перебором маршрутов и переходами по редиректам
 inline HttpResult Request(const std::string& method, const std::string& url, const std::string& headers = "",
                           const std::string* body = nullptr, const RequestOpts& o = RequestOpts()) {
     Url u = ParseUrl(url);
     HttpResult last;
     if (!u.ok) { last.err = "неверная ссылка " + url; return last; }
+    Trace().clear();
     std::vector<Route> routes;
     auto add = [&](const Route& r) {
         for (const auto& x : routes) if (x.kind == r.kind && x.proxy == r.proxy) return;
@@ -475,13 +492,19 @@ inline HttpResult Request(const std::string& method, const std::string& url, con
     add({ "direct", "", "напрямую" });
     if (o.allowProxies) { std::string ep = EnvProxy(); if (!ep.empty()) add({ "proxy", ep, "прокси из окружения (" + ep + ")" }); }
 
+    std::set<std::string> tried;
     auto attempt = [&](const Route& rt) {
+        if (!tried.insert(rt.kind + "|" + rt.proxy).second) return false;   // автопоиск нашёл уже проверенный путь
         Url cur = u;
         std::string m = method;
         const std::string* b = body;
         for (int hop = 0; hop < 5; ++hop) {
             HttpResult r = HttpOnce(rt, m, cur, headers, b, o.timeoutMs, o.maxBody);
-            if (!r.transportOk) { last = r; return false; }
+            if (!r.transportOk) {
+                Trace().push_back(rt.label + " - " + (r.err.empty() ? "нет ответа" : r.err));
+                if (!last.transportOk) last = r;
+                return false;
+            }
             if ((r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308) && !r.location.empty()) {
                 Url nu = ParseUrl(r.location);
                 if (!nu.ok) { last = r; return true; }
@@ -489,6 +512,13 @@ inline HttpResult Request(const std::string& method, const std::string& url, con
                 cur = nu;
                 continue;
             }
+            if (!ReachedSite(cur.host, r)) {
+                // ответ есть, но не от сайта (прокси без выхода в интернет) - пробуем следующий путь
+                Trace().push_back(rt.label + " - ответ HTTP " + std::to_string(r.status) + " не от " + cur.host + " (прокси без выхода?)");
+                if (!last.transportOk) last = r;
+                return false;
+            }
+            Trace().push_back(rt.label + " - дошло");
             last = r;
             if (o.allowProxies && (!haveCached || RouteToText(rt) != RouteToText(cached))) SaveRoute(u.host, rt);
             return true;
@@ -505,8 +535,10 @@ inline HttpResult Request(const std::string& method, const std::string& url, con
             if (!scanned.count(u.host)) scanned[u.host] = ScanLocalProxies(u.host);
             found = scanned[u.host];
         }
+        if (found.empty()) Trace().push_back("автопоиск: известные VPN-клиенты не слушают подходящие порты на 127.0.0.1");
         for (const auto& rt : found) if (attempt(rt)) return last;
     }
+    if (last.transportOk && !ReachedSite(u.host, last)) { last.transportOk = false; last.err = "до " + u.host + " не дошли"; }
     return last;
 }
 inline HttpResult Get(const std::string& url, const RequestOpts& o = RequestOpts(), const std::string& headers = "") {

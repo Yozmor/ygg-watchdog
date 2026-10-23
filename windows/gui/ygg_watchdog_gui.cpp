@@ -2090,7 +2090,7 @@ struct App {
             Flash(TrayPopupsEnabled() ? L"Всплывающие окна включены." : L"Всплывающие окна выключены (значок остаётся).");
             break;
         case BTN_TG_SAVE: SaveTelegram(); break;
-        case BTN_TG_TEST: RunCmd(L"отправляю тестовое сообщение", L"test-notify", CMD_GENERIC, 60000); break;
+        case BTN_TG_TEST: RunCmd(L"отправляю тестовое сообщение", L"test-notify", CMD_GENERIC, 240000); break;
         }
         Redraw();
     }
@@ -2135,14 +2135,20 @@ struct App {
     void WriteNotifyConf(const std::wstring& token, const std::wstring& chat, bool clearBoth) {
         std::wstring path = ExeDir() + L"notify.conf";
         std::wstring old = json::Parser::FromUtf8(ReadFileBytes(path));
+        if (!old.empty() && old[0] == 0xFEFF) old.erase(0, 1);   // метка BOM от Блокнота
         std::wstring keepToken, keepChat, rest;
         std::wstringstream ss(old);
         std::wstring ln;
         while (std::getline(ss, ln)) {
             if (!ln.empty() && ln.back() == L'\r') ln.pop_back();
-            if (ln.rfind(L"BOT_TOKEN=", 0) == 0) keepToken = ln.substr(10);
-            else if (ln.rfind(L"CHAT_ID=", 0) == 0) keepChat = ln.substr(8);
-            else if (!ln.empty()) rest += ln + L"\r\n";
+            // ключ узнаётся и с пробелами вокруг "=", как при чтении в ygg_watchdog.cpp
+            std::wstring t = util::Trim(ln);
+            size_t eq = (t.empty() || t[0] == L'#') ? std::wstring::npos : t.find(L'=');
+            std::wstring key = eq == std::wstring::npos ? L"" : util::Trim(t.substr(0, eq));
+            std::wstring val = eq == std::wstring::npos ? L"" : util::Trim(t.substr(eq + 1));
+            if (key == L"BOT_TOKEN") keepToken = val;
+            else if (key == L"CHAT_ID") keepChat = val;
+            else if (!t.empty()) rest += ln + L"\r\n";
         }
         std::wstring t = clearBoth ? L"" : (token.empty() ? keepToken : token);
         std::wstring c = clearBoth ? L"" : (chat.empty() ? keepChat : chat);

@@ -217,6 +217,51 @@ static void TestRoutes() {
     Check(!RouteFromText(L"мусор", back), L"мусор - не маршрут");
     auto names = ProxyClientNames();
     Check(std::find(names.begin(), names.end(), L"karing") != names.end(), L"Karing во встроенном списке клиентов");
+
+    HttpResult t;
+    t.transportOk = true; t.status = 200; t.body = "{\"ok\":true,\"result\":{}}";
+    Check(ReachedSite(L"api.telegram.org", t), L"ответ Telegram засчитан");
+    t.status = 401; t.body = "{\"ok\":false,\"error_code\":401}";
+    Check(ReachedSite(L"api.telegram.org", t), L"ошибка от самого Telegram - тоже до него дошли");
+    t.status = 502; t.body = "Bad Gateway";
+    Check(!ReachedSite(L"api.telegram.org", t), L"502 от прокси без выхода - не дошли");
+    t.status = 200; t.body = "<html>заглушка</html>";
+    Check(!ReachedSite(L"api.telegram.org", t), L"страница не от Telegram - не дошли");
+    t.transportOk = false;
+    Check(!ReachedSite(L"raw.githubusercontent.com", t), L"нет соединения - не дошли");
+}
+
+// notify.conf во временной папке tests\ (GetExeDir тестов), после проверки удаляется
+static NotifyConfig ConfFrom(const std::string& text) {
+    std::wstring p = GetExeDir() + L"notify.conf";
+    { std::ofstream f(std::filesystem::path(p), std::ios::binary | std::ios::trunc); f << text; }
+    NotifyConfig c = LoadNotifyConfig();
+    DeleteFileW(p.c_str());
+    return c;
+}
+
+static void TestNotifyConf() {
+    Section(L"notify.conf");
+    if (GetFileAttributesW((GetExeDir() + L"notify.conf").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        WriteOut(L"  пропущено: в папке тестов лежит свой notify.conf\r\n");
+        return;
+    }
+    NotifyConfig c = ConfFrom("\xEF\xBB\xBF" "BOT_TOKEN = 123456:AAH-x_y \r\nCHAT_ID=\"987654321\"\r\nPROXY=\r\nPROXY_CLIENTS=\r\n");
+    Check(c.valid && c.problem.empty(), L"BOM, пробелы и кавычки не мешают");
+    Eq(c.botToken, L"123456:AAH-x_y", L"токен без пробелов");
+    Eq(c.chatId, L"987654321", L"chat_id без кавычек");
+    Check(c.proxyOverride.empty() && !c.proxySocks, L"пустой PROXY= - автопоиск");
+    c = ConfFrom("BOT_TOKEN=123:abc\nCHAT_ID=-100200\n  PROXY = http://127.0.0.1:2080/\n");
+    Check(c.valid && c.problem.empty(), L"группа с минусом");
+    Eq(c.proxyOverride, L"127.0.0.1:2080", L"PROXY с http:// и / в конце");
+    c = ConfFrom("BOT_TOKEN=123:abc\nCHAT_ID=5\nPROXY=socks5://127.0.0.1:10808\n");
+    Check(c.valid && c.problem.empty() && c.proxySocks && c.proxyOverride.empty(), L"SOCKS в PROXY - пропуск, а не отказ");
+    c = ConfFrom("BOT_TOKEN=abc def\nCHAT_ID=5\n");
+    Check(!c.problem.empty(), L"токен без двоеточия - подсказка");
+    c = ConfFrom("BOT_TOKEN=123:abc\nCHAT_ID=моё\n");
+    Check(!c.problem.empty(), L"chat_id не число - подсказка");
+    c = ConfFrom("# BOT_TOKEN=123:abc\nCHAT_ID=5\n");
+    Check(!c.valid, L"закомментированный токен - не настроен");
 }
 
 static void TestJson() {
@@ -243,6 +288,7 @@ int wmain() {
     TestExeAndTask();
     TestJson();
     TestRoutes();
+    TestNotifyConf();
     WriteOut(L"\r\nПройдено: " + std::to_wstring(g_pass) + L", провалено: " + std::to_wstring(g_fail) + L"\r\n");
     return g_fail == 0 ? 0 : 1;
 }
