@@ -557,8 +557,12 @@ struct NotifyConfig {
 // невидимые символы из Telegram, "bot" из ссылки api.telegram.org/bot<токен>,
 // угловые скобки из инструкции. Всё это убирается.
 std::wstring CleanTelegramValue(const std::wstring& v, bool token) {
+    std::wstring in = v;
+    for (size_t p; (p = util::Lower(in).find(L"%3a")) != std::wstring::npos;) in.replace(p, 3, L":");   // из ссылки
     std::wstring out;
-    for (wchar_t c : v) {
+    for (wchar_t c : in) {
+        // похожие на двоеточие: полноширинное, математическое, модификаторы
+        if (c == 0xFF1A || c == 0x2236 || c == 0xA789 || c == 0x02D0 || c == 0x02F8 || c == 0xFE13 || c == 0xFE55 || c == 0x0589 || c == 0x05C3) c = L':';
         if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0x00A0 || c == 0xFEFF || c == 0x2060 ||
             (c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E) || c == L'<' || c == L'>' || c == L'"' || c == L'\'')
             continue;
@@ -569,9 +573,30 @@ std::wstring CleanTelegramValue(const std::wstring& v, bool token) {
 }
 
 // Что не так с токеном (пусто - похож на настоящий): 123456789:AAH... - цифры, двоеточие, латиница/цифры/_/-
+// Приметы токена без секретной части: длина, первые 3 знака, необычные символы
+std::wstring TokenHints(const std::wstring& t) {
+    std::wstring odd;
+    std::set<wchar_t> seen;
+    for (wchar_t c : t) {
+        bool plain = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'_' || c == L'-' || c == L':';
+        if (plain || !seen.insert(c).second || seen.size() > 5) continue;
+        wchar_t hex[8];
+        swprintf(hex, 8, L"%04X", (unsigned)c);
+        odd += (odd.empty() ? L"" : L" ") + std::wstring(L"«") + c + L"»U+" + hex;
+    }
+    return L"длина " + std::to_wstring(t.size()) + L", начало «" + t.substr(0, 3) + L"…»" +
+           (odd.empty() ? L"" : L", необычные символы: " + odd);
+}
+
 std::wstring TelegramTokenProblem(const std::wstring& t) {
     size_t colon = t.find(L':');
-    if (colon == std::wstring::npos) return L"в BOT_TOKEN нет двоеточия - скопирован не целиком? Нужен вид 123456789:AAH...";
+    bool digitsOnly = !t.empty() && std::all_of(t.begin(), t.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+    if (colon == std::wstring::npos && digitsOnly)
+        return L"в BOT_TOKEN одни цифры (" + TokenHints(t) + L") - похоже, туда попал chat_id или только номер бота. "
+               L"Токен от @BotFather выглядит как 123456789:AAH... - с двоеточием и буквами";
+    if (colon == std::wstring::npos)
+        return L"в BOT_TOKEN нет двоеточия (" + TokenHints(t) + L") - нужен вид 123456789:AAH..., около 46 знаков. "
+               L"Скопируй токен у @BotFather заново целиком";
     if (colon == 0) return L"в BOT_TOKEN нет цифр перед двоеточием - нужен вид 123456789:AAH...";
     if (colon + 1 >= t.size()) return L"в BOT_TOKEN пусто после двоеточия - скопирован не целиком";
     for (size_t i = 0; i < t.size(); ++i) {
@@ -1370,6 +1395,19 @@ std::wstring GetDeviceName() {
 }
 
 std::wstring g_telegramLastVia, g_telegramLastErr;   // для test-notify
+bool g_telegramForceEvent = false;                  // test-notify: в журнал всегда
+
+// Ошибка Telegram - в журнал событий окна (вкладка «Журнал»), чтобы её было
+// видно целиком. Та же ошибка повторяется не чаще раза в 6 ч.
+void TelegramErrorEvent(const std::wstring& err) {
+    long long now = (long long)time(nullptr), at = 0;
+    try { at = std::stoll(util::RegReadPath(REG_WATCHDOG_KEY, L"TgEventAt")); } catch (...) {}
+    std::wstring prev = util::RegReadPath(REG_WATCHDOG_KEY, L"TgEventErr");
+    if (!g_telegramForceEvent && prev == err && now - at < 6 * 3600) return;
+    AppendEvent(L"warn", L"Telegram: сообщение не ушло - " + err);
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgEventAt", std::to_wstring(now));
+    util::RegWriteString(REG_WATCHDOG_KEY, L"TgEventErr", err);
+}
 
 bool SendTelegramNotification(const std::wstring& message) {
     NotifyConfig config = LoadNotifyConfig();
@@ -1382,6 +1420,7 @@ bool SendTelegramNotification(const std::wstring& message) {
         util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastVia", L"");
         util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastErr", config.problem);
         LogError(L"Telegram: сообщение не отправлено - " + config.problem);
+        TelegramErrorEvent(config.problem);
         return false;
     }
 
@@ -1399,7 +1438,8 @@ bool SendTelegramNotification(const std::wstring& message) {
     util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastOk", ok ? L"1" : L"0");
     util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastVia", ok ? via : L"");
     util::RegWriteString(REG_WATCHDOG_KEY, L"TgLastErr", ok ? L"" : err);
-    if (!ok) LogError(L"Telegram: сообщение не отправлено - " + err);   // раньше это было видно только с -v
+    if (!ok) { LogError(L"Telegram: сообщение не отправлено - " + err); TelegramErrorEvent(err); }
+    else util::RegWriteString(REG_WATCHDOG_KEY, L"TgEventErr", L"");   // ушло - следующая ошибка снова попадёт в журнал
     return ok;
 }
 
@@ -2750,7 +2790,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.4"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.5"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -5344,10 +5384,13 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         // токен через командную строку не передаётся.
         NotifyConfig config = LoadNotifyConfig();
         if (!config.valid) {
+            AppendEvent(L"warn", L"Telegram: не настроен - в notify.conf нет BOT_TOKEN или CHAT_ID");
             PrintError(L"Telegram не настроен: в notify.conf нет BOT_TOKEN или CHAT_ID.");
             return 1;
         }
+        g_telegramForceEvent = true;
         bool sent = SendTelegramNotification(L"Проверка связи: уведомления ygg-watchdog работают.");
+        if (sent) AppendEvent(L"ok", L"Telegram: тестовое сообщение ушло (" + g_telegramLastVia + L")");
         if (config.problem.empty()) {
             Print(L"Пути до Telegram по очереди:");
             for (const auto& t : g_routeTrace) Print(L"  " + t);

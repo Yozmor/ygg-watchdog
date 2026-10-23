@@ -1779,10 +1779,10 @@ struct App {
             unsigned c = tg ? COL_OK : th.muted;
             if (tg && tl[L"at"].i64() > 0) {
                 if (tl[L"ok"].boolean()) v = HhMm(tl[L"at"].i64()) + L" ушло: " + tl[L"via"].str();
-                else { v = HhMm(tl[L"at"].i64()) + L" НЕ ушло: " + tl[L"err"].str(); c = COL_ALERT; }
+                else { v = HhMm(tl[L"at"].i64()) + L" НЕ ушло, целиком - в журнале [L]: " + tl[L"err"].str(); c = COL_ALERT; }
             }
             r.Text(L"Telegram", 544, y, 100, 20, Rgb(th.muted), 12);
-            r.Text(v, 630, y, 370, 20, Rgb(c), 11, false, Right);   // длинное обрезается рамкой
+            r.Text(v, 630, y, 370, 20, Rgb(c), 11, false, Left);   // длинное обрезается справа - начало видно, целиком в журнале
             y += 24;
         }
         Caption(th, 544, 466, 220, tg ? L"новый токен бота" : L"токен бота");

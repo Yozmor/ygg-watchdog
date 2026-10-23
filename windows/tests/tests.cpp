@@ -263,6 +263,12 @@ static void TestNotifyConf() {
     c = ConfFrom("BOT_TOKEN=\xC2\xA0" "123:ab\xE2\x80\x8B" "c\xC2\xA0\nCHAT_ID=5\xC2\xA0\n");
     Check(c.problem.empty(), L"неразрывный пробел и невидимый символ вычищаются");
     Eq(c.botToken, L"123:abc", L"токен после чистки");
+    c = ConfFrom("BOT_TOKEN=123\xEF\xBC\x9A" "abc\nCHAT_ID=5\n");
+    Eq(c.botToken, L"123:abc", L"полноширинное двоеточие исправляется");
+    c = ConfFrom("BOT_TOKEN=123%3Aabc\nCHAT_ID=5\n");
+    Eq(c.botToken, L"123:abc", L"%3A из ссылки исправляется");
+    c = ConfFrom("BOT_TOKEN=987654321\nCHAT_ID=5\n");
+    Check(c.problem.find(L"длина 9") != std::wstring::npos, L"без двоеточия - приметы токена в подсказке");
     c = ConfFrom("BOT_TOKEN=bot123:abc\nCHAT_ID=5\n");
     Eq(c.botToken, L"123:abc", L"bot из ссылки убирается");
     c = ConfFrom("BOT_TOKEN=123:ab\xC3\xA9" "c\nCHAT_ID=5\n");
