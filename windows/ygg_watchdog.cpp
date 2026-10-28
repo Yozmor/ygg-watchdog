@@ -2790,7 +2790,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.6"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.7"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -3022,6 +3022,10 @@ bool DownloadRepoFile(const std::wstring& repoPath, const std::wstring& dest, st
 // переименовать можно) и ставит новый на его место, ещё раз проверяет уже на
 // месте - не прошёл, возвращает старый. Значок в трее перезапускается на
 // новой версии. Запускать ТОЛЬКО по явной команде.
+std::wstring UpdateGuardFromRepo();   // ниже, рядом со стражем
+bool WatchdogTaskInstalled();
+void InstallScheduledTask();
+
 // Пусто - обновлено; иначе - почему нет (для окна и консоли).
 std::wstring ApplyUpdate() {
     std::wstring lastErr;
@@ -3098,6 +3102,16 @@ std::wstring ApplyUpdate() {
         return lastErr;
     }
     LogInfo(L"Обновлено до " + info->tag + L" (прежняя версия сохранена как " + std::filesystem::path(bak).filename().wstring() + L").");
+
+    // комплект: страж обновляется вместе со сторожем (или ставится, если его нет)
+    std::wstring gErr = UpdateGuardFromRepo();
+    if (!gErr.empty()) {
+        std::wstring m = L"ygg-watchdog обновлён до " + info->tag + L", но " + gErr + L". Проверки идут без стража - сторож попробует ещё раз на следующей проверке.";
+        LogError(m);
+        Notify(L"warn", m);
+    } else if (WatchdogTaskInstalled() && util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") != L"1") {
+        InstallScheduledTask();   // задача шла без стража - теперь через него
+    }
 
     // значок в трее работает на старом файле - перезапускаем на новом
     HWND trayWnd = FindWindowW(L"YggWatchdogTrayMsg", nullptr);
@@ -4977,13 +4991,20 @@ std::wstring RepairGuardFromRepo(const std::wstring& why) {
     return L"";
 }
 
-// Сторож на каждой проверке смотрит, цел ли страж. Если задача из-за битого
-// стража работала напрямую (без проверки целостности exe), а страж снова цел -
-// задача возвращается на стража.
+// Установлена ли задача автопроверок (удалил сам - стража не трогаем)
+bool WatchdogTaskInstalled() {
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool ok = ygg::QueryTask(L"YggWatchdogTick").ok;
+    if (SUCCEEDED(hrInit)) CoUninitialize();
+    return ok;
+}
+
+// Сторож на каждой проверке смотрит, цел ли страж (пока задача установлена):
+// нет файла или он битый - скачивает целого. Если задача работает напрямую,
+// без стража (страж был битый при установке, или задачу ставила старая
+// версия), а страж цел - задача возвращается на стража.
 void EnsureGuardHealthy() {
-    bool usesGuard = util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") == L"1";
-    bool fallback = util::RegReadPath(REG_WD_KEY, L"TaskDirectFallback") == L"1";
-    if (!usesGuard && !fallback) return;   // задачи нет или стража не было никогда
+    if (!WatchdogTaskInstalled()) return;
     std::wstring why = CheckExeIntegrity(GuardExePath(), false);
     if (!why.empty()) {
         long long now = (long long)time(nullptr), last = 0;
@@ -4992,15 +5013,39 @@ void EnsureGuardHealthy() {
         util::RegWriteString(REG_WD_KEY, L"GuardSelfRepairAt", std::to_wstring(now));
         std::wstring err = RepairGuardFromRepo(why);
         if (!err.empty()) {
-            Notify(L"alert", L"Страж ygg_guard.exe повреждён (" + why + L"), " + err +
-                             L". Проверки идут напрямую, без проверки целостности ygg_watchdog.exe - собери заново (run_ygg_watchdog.bat).");
+            Notify(L"alert", L"Страж ygg_guard.exe: " + why + L", " + err +
+                             L". Проверки идут без проверки целостности ygg_watchdog.exe - собери заново (run_ygg_watchdog.bat).");
             return;
         }
     }
-    if (fallback) {
-        LogInfo(L"Страж снова цел - возвращаю задачу на него.");
+    if (util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") != L"1") {
+        LogInfo(L"Задача работает без стража, а он цел - возвращаю задачу на стража.");
         InstallScheduledTask();
     }
+}
+
+// При обновлении: страж такой же, как в репозитории? Нет файла, битый или
+// другой - скачать из репозитория. Пусто - всё в порядке, иначе - что не вышло.
+std::wstring UpdateGuardFromRepo() {
+    RepoFile f = GetRepoFile(L"windows/ygg_guard.exe");
+    if (!f.ok) return L"страж: " + f.err;
+    std::wstring g = GuardExePath();
+    if (util::FileExists(g) && f.sha.size() == 40 && GitBlobSha1Hex(ReadBytes(g)) == f.sha && CheckExeIntegrity(g, false).empty())
+        return L"";   // тот же, что в репозитории
+    std::wstring tmp = g + L".download", err;
+    if (!DownloadRepoFile(L"windows/ygg_guard.exe", tmp, err)) return L"страж не скачался: " + err;
+    if (util::FileExists(g) && !MoveFileExW(g.c_str(), (g + L".backup").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return L"старый страж не отодвигается (ошибка " + std::to_wstring(GetLastError()) + L")";
+    }
+    if (!MoveFileExW(tmp.c_str(), g.c_str(), 0)) {
+        DWORD e = GetLastError();
+        MoveFileExW((g + L".backup").c_str(), g.c_str(), 0);
+        DeleteFileW(tmp.c_str());
+        return L"новый страж не встал на место (ошибка " + std::to_wstring(e) + L")";
+    }
+    LogInfo(L"Страж ygg_guard.exe обновлён из репозитория.");
+    return L"";
 }
 
 // Отпечаток своего exe для стража: размер, время записи и SHA-256. Пишется,
@@ -5402,6 +5447,7 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
             SaveState(st);
         }
         if (!info.has_value() && !g_updateCheckError.empty()) {
+            AppendEvent(L"warn", L"Проверка обновления не удалась: " + g_updateCheckError);
             PrintError(L"не удалось проверить: " + g_updateCheckError + L" (у тебя " + CURRENT_VERSION + L").");
             return 1;
         } else if (!info.has_value()) {
@@ -5412,7 +5458,8 @@ int WatchdogMain(int argc, wchar_t* argv[]) {
         }
     } else if (command == L"apply-update") {
         std::wstring err = ApplyUpdate();
-        if (!err.empty()) { PrintError(err); return 1; }
+        if (!err.empty()) { AppendEvent(L"warn", L"Обновление не установлено: " + err); PrintError(err); return 1; }
+        AppendEvent(L"ok", L"ygg-watchdog обновлён - закрой и открой окно.");
         Print(L"Обновлено.");
     } else if (command == L"test-notify") {
         // Для кнопки «Проверить» в окне: notify.conf пишет само окно,
