@@ -173,8 +173,17 @@ static const GUID kIidExecAction      = { 0x4c3d624d, 0xfd6b, 0x49a3, { 0xb9, 0x
 
 // Что на самом деле стережёт задача: если она запускает стража (ygg_guard.exe) -
 // это ygg_watchdog.exe рядом с ним.
-inline std::wstring TaskTargetExe(const std::wstring& path, const std::wstring& /*args*/) {
+inline std::wstring TaskTargetExe(const std::wstring& path0, const std::wstring& args) {
+    std::wstring path = path0;
     std::wstring lp = util::Lower(path);
+    // cmd /c ""...\ygg_guard.exe" || "...\ygg_watchdog.exe" tick" - берём первый путь в кавычках
+    const std::wstring cmdExe = L"cmd.exe";
+    if (lp.size() >= cmdExe.size() && lp.compare(lp.size() - cmdExe.size(), cmdExe.size(), cmdExe) == 0) {
+        size_t a = args.find(L":\\");
+        size_t q = a == std::wstring::npos ? a : args.rfind(L'"', a);
+        size_t e = q == std::wstring::npos ? q : args.find(L'"', q + 1);
+        if (e != std::wstring::npos) { path = args.substr(q + 1, e - q - 1); lp = util::Lower(path); }
+    }
     const std::wstring guard = L"ygg_guard.exe";
     if (lp.size() >= guard.size() && lp.compare(lp.size() - guard.size(), guard.size(), guard) == 0)
         return util::DirOf(path) + L"ygg_watchdog.exe";
@@ -283,10 +292,10 @@ static const wchar_t* PANEL_VERSION = L"1.1.0";
 
 // ------------------------------------------------------------------
 // Обновление самой панели - прямо из репозитория Yozmor/ygg-control
-// (релизов нет): версия - PANEL_VERSION в src/core.h, программа -
-// ygg_control.exe в корне репозитория. Скачанный файл проверяется по
-// git-отпечатку, который GitHub отдаёт вместе с файлом: обрезанный или
-// подменённый по дороге не пройдёт.
+// (релизов нет): версия - PANEL_VERSION в windows/src/core.h, программа -
+// windows/ygg_control.exe. Скачанный файл проверяется по git-отпечатку,
+// который GitHub отдаёт вместе с файлом (обрезанный по дороге не пройдёт),
+// и самопроверкой: новый exe должен запуститься и назвать свою версию.
 // ------------------------------------------------------------------
 static const wchar_t* PANEL_REPO_API = L"https://api.github.com/repos/Yozmor/ygg-control/contents/";
 static const wchar_t* PANEL_REPO_PAGE = L"https://github.com/Yozmor/ygg-control";
@@ -354,7 +363,7 @@ inline UpdateInfo CheckPanelUpdate() {
     UpdateInfo u;
     u.checked = true;
     u.at = (long long)time(nullptr);
-    RepoFileInfo src = GetRepoFileInfo(PANEL_REPO_API, L"src/core.h");
+    RepoFileInfo src = GetRepoFileInfo(PANEL_REPO_API, L"windows/src/core.h");
     if (!src.ok) { u.err = src.err; return u; }
     std::string text = util::HttpGet(src.url, nullptr, 4 * 1024 * 1024);
     // строка вида: static const wchar_t* PANEL_VERSION = L"1.1.0";
@@ -372,7 +381,7 @@ inline UpdateInfo CheckPanelUpdate() {
 // иначе - почему нет. expectVer - версия из src/core.h: скачанный exe
 // запускается с --selftest и обязан назвать именно её.
 inline std::wstring DownloadPanelExe(const std::wstring& dest, const std::wstring& expectVer = L"") {
-    RepoFileInfo f = GetRepoFileInfo(PANEL_REPO_API, L"ygg_control.exe");
+    RepoFileInfo f = GetRepoFileInfo(PANEL_REPO_API, L"windows/ygg_control.exe");
     if (!f.ok) return f.err;
     DWORD st = 0;
     std::string data = util::HttpGet(f.url, &st, 200 * 1024 * 1024);

@@ -79,7 +79,8 @@
 
 ```bash
 sudo apt install g++ libssl-dev git
-git clone https://github.com/Yozmor/ygg-watchdog.git /tmp/ygg-src
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Yozmor/ygg-watchdog.git /tmp/ygg-src
+git -C /tmp/ygg-src sparse-checkout set linux
 mkdir -p ~/ygg-watchdog
 cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
 rm -rf /tmp/ygg-src
@@ -90,7 +91,7 @@ sudo ./install.sh
 
 Что происходит по шагам:
 1. ставятся компилятор и OpenSSL для сборки;
-2. репозиторий скачивается во временную папку `/tmp/ygg-src`;
+2. во временную папку `/tmp/ygg-src` скачивается только папка `linux` из репозитория (Windows-часть не загружается);
 3. создаётся папка программы `~/ygg-watchdog`, туда копируются файлы из папки `linux` (именно файлы, без лишней вложенной папки);
 4. временная папка удаляется;
 5. `build.sh` собирает программу `ygg-watchdog` (шаг можно пропустить — готовая уже лежит в репозитории);

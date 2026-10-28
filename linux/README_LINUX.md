@@ -28,7 +28,8 @@
 
 ```bash
 sudo apt install g++ libssl-dev git
-git clone https://github.com/Yozmor/ygg-watchdog.git /tmp/ygg-src
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Yozmor/ygg-watchdog.git /tmp/ygg-src
+git -C /tmp/ygg-src sparse-checkout set linux
 mkdir -p ~/ygg-watchdog
 cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
 rm -rf /tmp/ygg-src

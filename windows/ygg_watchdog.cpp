@@ -2790,7 +2790,7 @@ void WarnVpnMayBeNeeded() {
 // команде apply-update (её запускает пользователь руками - это и есть
 // согласие, отдельный пароль не нужен).
 // ------------------------------------------------------------------
-const std::wstring CURRENT_VERSION = L"1.2.5"; // поднимать вручную при выпуске новой версии
+const std::wstring CURRENT_VERSION = L"1.2.6"; // поднимать вручную при выпуске новой версии
 const long long UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600;
 
 std::vector<int> VersionTuple(const std::wstring& v) {
@@ -4960,29 +4960,47 @@ std::wstring CheckExeIntegrity(const std::wstring& path, bool checkHash) {
     return L"";
 }
 
-// Сторож проверяет стража (если задача настроена через него)
-void EnsureGuardHealthy() {
-    if (util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") != L"1") return;
-    std::wstring why = CheckExeIntegrity(GuardExePath(), false);
-    if (why.empty()) return;
-    long long now = (long long)time(nullptr), last = 0;
-    try { last = std::stoll(util::RegReadPath(REG_WD_KEY, L"GuardSelfRepairAt")); } catch (...) {}
-    if (now - last < 3600) return;                     // пробовали меньше часа назад
-    util::RegWriteString(REG_WD_KEY, L"GuardSelfRepairAt", std::to_wstring(now));
+void InstallScheduledTask();
+
+// Скачать целого стража из репозитория вместо битого. Пусто - получилось.
+std::wstring RepairGuardFromRepo(const std::wstring& why) {
     std::wstring tmp = GuardExePath() + L".download", err;
-    if (!DownloadRepoFile(L"windows/ygg_guard.exe", tmp, err)) {
-        Notify(L"alert", L"Страж ygg_guard.exe повреждён (" + why + L"), а скачать целый не удалось: " + err +
-                         L". Автопроверки не идут - собери заново (run_ygg_watchdog.bat) и переустанови задачу.");
-        return;
-    }
+    if (!DownloadRepoFile(L"windows/ygg_guard.exe", tmp, err)) return L"скачать целый не удалось: " + err;
+    long long now = (long long)time(nullptr);
     if (util::FileExists(GuardExePath()))
         MoveFileExW(GuardExePath().c_str(), (GuardExePath() + L".broken-" + util::TimeText(now, L"%Y%m%d-%H%M%S")).c_str(), MOVEFILE_REPLACE_EXISTING);
     if (!MoveFileExW(tmp.c_str(), GuardExePath().c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmp.c_str());
-        Notify(L"alert", L"Страж ygg_guard.exe повреждён (" + why + L"), и заменить его не удалось.");
-        return;
+        return L"заменить его не удалось";
     }
     Notify(L"warn", L"Страж ygg_guard.exe был повреждён (" + why + L") - скачан целый из репозитория.");
+    return L"";
+}
+
+// Сторож на каждой проверке смотрит, цел ли страж. Если задача из-за битого
+// стража работала напрямую (без проверки целостности exe), а страж снова цел -
+// задача возвращается на стража.
+void EnsureGuardHealthy() {
+    bool usesGuard = util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") == L"1";
+    bool fallback = util::RegReadPath(REG_WD_KEY, L"TaskDirectFallback") == L"1";
+    if (!usesGuard && !fallback) return;   // задачи нет или стража не было никогда
+    std::wstring why = CheckExeIntegrity(GuardExePath(), false);
+    if (!why.empty()) {
+        long long now = (long long)time(nullptr), last = 0;
+        try { last = std::stoll(util::RegReadPath(REG_WD_KEY, L"GuardSelfRepairAt")); } catch (...) {}
+        if (now - last < 3600) return;                     // пробовали меньше часа назад
+        util::RegWriteString(REG_WD_KEY, L"GuardSelfRepairAt", std::to_wstring(now));
+        std::wstring err = RepairGuardFromRepo(why);
+        if (!err.empty()) {
+            Notify(L"alert", L"Страж ygg_guard.exe повреждён (" + why + L"), " + err +
+                             L". Проверки идут напрямую, без проверки целостности ygg_watchdog.exe - собери заново (run_ygg_watchdog.bat).");
+            return;
+        }
+    }
+    if (fallback) {
+        LogInfo(L"Страж снова цел - возвращаю задачу на него.");
+        InstallScheduledTask();
+    }
 }
 
 // Отпечаток своего exe для стража: размер, время записи и SHA-256. Пишется,
@@ -5082,7 +5100,7 @@ static std::wstring HrText(const wchar_t* step, HRESULT hr) {
     return std::wstring(step) + L" (" + b + L")";
 }
 
-bool RegisterWatchdogTask(const std::wstring& exe, const std::wstring& args, std::wstring& err) {
+bool RegisterWatchdogTask(const std::wstring& exe, const std::wstring& args, std::wstring& err, const std::wstring& workDir = L"") {
     HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool ok = false;
     ITaskService* svc = nullptr; ITaskFolder* root = nullptr; ITaskDefinition* def = nullptr;
@@ -5135,7 +5153,7 @@ bool RegisterWatchdogTask(const std::wstring& exe, const std::wstring& args, std
         if (FAILED(hr = def->get_Actions(&acts)) || FAILED(hr = acts->Create(TASK_ACTION_EXEC, &act)) ||
             FAILED(hr = act->QueryInterface(ygg::kIidExecAction, (void**)&ex))) { err = HrText(L"не создаётся действие", hr); break; }
         {
-            BSTR p = B(exe), a = B(args), wd = B(util::DirOf(exe));
+            BSTR p = B(exe), a = B(args), wd = B(workDir.empty() ? util::DirOf(exe) : workDir);
             ex->put_Path(p); ex->put_Arguments(a); ex->put_WorkingDirectory(wd);
             SysFreeString(p); SysFreeString(a); SysFreeString(wd);
         }
@@ -5173,20 +5191,36 @@ bool DeleteWatchdogTask(std::wstring& err) {
 }
 
 void InstallScheduledTask() {
-    // Если рядом целый страж - задача запускает его (он проверит exe и запустит tick);
-    // иначе - сам exe напрямую, без проверки целостности.
+    // Страж битый или пропал - сначала пробуем достать целого из репозитория
+    std::wstring why = CheckExeIntegrity(GuardExePath(), false);
+    if (!why.empty()) {
+        std::wstring e = RepairGuardFromRepo(why);
+        if (!e.empty()) LogError(L"Страж ygg_guard.exe: " + why + L", " + e);
+    }
     bool guard = CheckExeIntegrity(GuardExePath(), false).empty();
-    std::wstring exe = guard ? GuardExePath() : WatchdogExePath();
-    std::wstring args = guard ? L"" : L"tick";
     std::wstring err;
-    if (!RegisterWatchdogTask(exe, args, err)) {
+    bool ok;
+    if (guard) {
+        // cmd /c ""страж" || "сторож" tick": страж не стартовал (битый файл) - cmd
+        // запускает сторожа напрямую, а тот на этой же проверке чинит стража
+        wchar_t sys[MAX_PATH] = L"";
+        GetSystemDirectoryW(sys, MAX_PATH);
+        std::wstring cmd = std::wstring(sys) + L"\\cmd.exe";
+        std::wstring args = L"/c \"\"" + GuardExePath() + L"\" || \"" + WatchdogExePath() + L"\" tick\"";
+        ok = RegisterWatchdogTask(cmd, args, err, GetExeDir());
+    } else {
+        ok = RegisterWatchdogTask(WatchdogExePath(), L"tick", err);
+    }
+    if (!ok) {
         LogError(L"Задача не установлена: " + err);
         return;
     }
     util::RegWriteString(REG_WD_KEY, L"TaskUsesGuard", guard ? L"1" : L"0");
-    if (guard) LogInfo(L"Задача YggWatchdogTick установлена: каждые 3 минуты, через стража (ygg_guard.exe).");
-    else LogInfo(L"Задача YggWatchdogTick установлена: каждые 3 минуты, напрямую - стража ygg_guard.exe рядом нет "
-                 L"(собери его run_ygg_watchdog.bat и переустанови задачу, чтобы exe проверялся на целостность).");
+    util::RegWriteString(REG_WD_KEY, L"TaskDirectFallback", guard ? L"0" : L"1");
+    if (guard) LogInfo(L"Задача YggWatchdogTick установлена: каждые 3 минуты, через стража (ygg_guard.exe); "
+                       L"если страж не запустится - сторож напрямую.");
+    else LogInfo(L"Задача YggWatchdogTick установлена: каждые 3 минуты, напрямую - целого стража ygg_guard.exe нет "
+                 L"и скачать не вышло. Как только он появится, сторож сам вернёт задачу на стража.");
 }
 
 // Удаляет задачу: автоматические проверки прекращаются до следующей установки.
@@ -5194,6 +5228,7 @@ void UninstallScheduledTask() {
     std::wstring err;
     if (DeleteWatchdogTask(err)) {
         util::RegWriteString(REG_WD_KEY, L"TaskUsesGuard", L"0");
+        util::RegWriteString(REG_WD_KEY, L"TaskDirectFallback", L"0");
         LogInfo(L"Задача удалена. Автоматические проверки остановлены - чтобы включить снова, установи задачу ещё раз.");
     } else {
         LogError(L"Задача не удалена: " + err);

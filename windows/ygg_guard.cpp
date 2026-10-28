@@ -11,6 +11,8 @@
 //      репозитория со сверкой отпечатка; не вышло - берёт
 //      ygg_watchdog.exe.backup от прошлого обновления. Не чаще раза в час;
 //   4. о восстановлении пишет в watchdog.log, events.log и в Telegram.
+// Задача запускает его как cmd /c ""ygg_guard.exe" || "ygg_watchdog.exe" tick":
+// если битый сам страж, cmd запустит сторожа напрямую, и тот починит стража.
 // Сторож, в свою очередь, на каждой проверке смотрит, цел ли страж.
 //
 // Код общий со сторожем (подключается ygg_watchdog.cpp без его точки входа),
@@ -112,10 +114,12 @@ int GuardMain() {
     util::RegWriteString(REG_WD_KEY, L"GuardFails", std::to_wstring(fails));
     if (fails < 2) {
         LogError(L"страж: ygg_watchdog.exe: " + why + L" - если повторится на следующем ходе, восстановлю");
-        return 1;
+        return 0;
     }
     if (RepairWatchdogExe(exe, why)) RunTickOnce(exe);
-    return 1;
+    // Код возврата всегда 0: задача запускает "страж || сторож tick", и сторож
+    // напрямую должен запускаться, только если сам страж не стартовал (битый файл).
+    return 0;
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
