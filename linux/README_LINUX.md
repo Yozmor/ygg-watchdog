@@ -34,7 +34,7 @@ mkdir -p ~/ygg-watchdog
 cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
 rm -rf /tmp/ygg-src
 cd ~/ygg-watchdog
-chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск (из Windows-коммита оно теряется)
+chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск 
 ./build.sh              # можно пропустить: готовая ygg-watchdog уже лежит в папке
 sudo ./install.sh
 ```
@@ -75,19 +75,6 @@ ygg-watchdog
 1. скачивается `linux/ygg-watchdog` и сверяется его git-отпечаток с репозиторием;
 2. новая версия запускается с `--selftest` и должна назвать ту версию, что в исходнике (так ловится и «exe забыли закоммитить»);
 3. файл заменяется, старый остаётся как `ygg-watchdog.backup`; если на месте новая версия не прошла самопроверку — старая возвращается сама.
-
-### Выпуск новой версии (для автора)
-
-1. Подними `WATCHDOG_VERSION` в `linux/src/watchdog/version.h`.
-2. Собери: `./build.sh`, проверь: `./tests/run_tests.sh`.
-3. Закоммить вместе `version.h` и собранный `linux/ygg-watchdog`.
-
-Чтобы разрешение на запуск хранилось в самом репозитории и `chmod` после клонирования был не нужен, один раз выполни в репозитории (можно и на Windows, в Git Bash):
-
-```bash
-git update-index --chmod=+x linux/build.sh linux/install.sh linux/tests/run_tests.sh linux/ygg-watchdog
-git commit -m "linux: разрешение на запуск"
-```
 
 ## Уведомления в Telegram
 
