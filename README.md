@@ -85,7 +85,7 @@ mkdir -p ~/ygg-watchdog
 cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
 rm -rf /tmp/ygg-src
 cd ~/ygg-watchdog
-chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск (из Windows-коммита оно теряется)
+chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск 
 ./build.sh
 sudo ./install.sh
 ```
