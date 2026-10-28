@@ -3109,7 +3109,7 @@ std::wstring ApplyUpdate() {
         std::wstring m = L"ygg-watchdog обновлён до " + info->tag + L", но " + gErr + L". Проверки идут без стража - сторож попробует ещё раз на следующей проверке.";
         LogError(m);
         Notify(L"warn", m);
-    } else if (WatchdogTaskInstalled() && util::RegReadPath(REG_WD_KEY, L"TaskUsesGuard") != L"1") {
+    } else if (WatchdogTaskInstalled() && util::RegReadPath(REG_WATCHDOG_KEY, L"TaskUsesGuard") != L"1") {
         InstallScheduledTask();   // задача шла без стража - теперь через него
     }
 
