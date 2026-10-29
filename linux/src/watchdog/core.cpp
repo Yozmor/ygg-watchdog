@@ -14,6 +14,7 @@
 #include "../common/json.h"
 #include "../common/net.h"
 #include "../common/ygg.h"
+#include "../common/repobuild.h"
 #include "version.h"
 #include <atomic>
 #include <mutex>
@@ -1740,23 +1741,44 @@ bool DownloadRepoFile(const std::string& repoPath, std::string& data, std::strin
     data = r.body;
     return true;
 }
+// Собрать ygg-watchdog из исходников репозитория здесь же, в fresh
+std::string BuildWatchdogFromRepo(const std::string& tag, const std::string& fresh, const std::string& why) {
+    LogInfo(why + " - собираю " + tag + " из исходников...");
+    repobuild::Result b = repobuild::Build(std::string(REPO_PAGE) + ".git", "ygg-watchdog", ProgDir() + "update-build.log");
+    if (!b.err.empty()) { repobuild::Cleanup(b); return why + ", а " + b.err; }
+    std::string got = SelfTestVersion(b.built);
+    if (got != tag) { repobuild::Cleanup(b); return got.empty() ? "собранная версия не запускается" : "собралась версия " + got + ", а в version.h " + tag; }
+    if (!util::CopyFile(b.built, fresh)) { repobuild::Cleanup(b); return "не удалось записать " + fresh + " (нужен root)"; }
+    chmod(fresh.c_str(), 0755);
+    repobuild::SyncSources(b, ProgDir(), "ygg-watchdog");
+    repobuild::Cleanup(b);
+    return "";
+}
 // Установка обновления. Возвращает текст ошибки или "" (успех).
+// Есть в репозитории готовый linux/ygg-watchdog нужной версии - берём его;
+// нет (или он старый) - собираем из исходников на этом компьютере.
 std::string ApplyUpdate(std::string* installedTag = nullptr) {
     std::string tag = CheckForUpdate();
     if (tag.empty()) return g_updateCheckError.empty() ? "новых версий нет" : "не удалось проверить обновление: " + g_updateCheckError;
     std::string self = util::SelfExe(), dir = util::DirOf(self);
+    std::string fresh = dir + "ygg-watchdog.new";
     std::string data, err;
     LogInfo("Скачиваю новую версию " + tag + " из репозитория...");
-    if (!DownloadRepoFile("linux/ygg-watchdog", data, err)) return "не удалось скачать: " + err;
-    if (!util::LooksLikeElf(data)) return "скачанный файл не похож на целую программу (нет заголовка ELF)";
-    std::string fresh = dir + "ygg-watchdog.new";
-    if (!util::WriteFile(fresh, data, 0755)) return "не удалось записать " + fresh + " (нужен root)";
-    chmod(fresh.c_str(), 0755);
-    std::string got = SelfTestVersion(fresh);
-    if (got != tag) {
-        unlink(fresh.c_str());
-        return got.empty() ? "скачанная версия " + tag + " не прошла самопроверку (не запускается на этом компьютере)"
-                           : "в репозитории номер версии " + tag + ", а linux/ygg-watchdog внутри " + got + " - похоже, свежую сборку забыли закоммитить";
+    if (!DownloadRepoFile("linux/ygg-watchdog", data, err)) {
+        if (!util::StartsWith(err, "в репозитории нет")) return "не удалось скачать: " + err;
+        std::string e = BuildWatchdogFromRepo(tag, fresh, "готовой программы в репозитории нет");
+        if (!e.empty()) return e;
+    } else {
+        if (!util::LooksLikeElf(data)) return "скачанный файл не похож на целую программу (нет заголовка ELF)";
+        if (!util::WriteFile(fresh, data, 0755)) return "не удалось записать " + fresh + " (нужен root)";
+        chmod(fresh.c_str(), 0755);
+        std::string got = SelfTestVersion(fresh);
+        if (got != tag) {
+            unlink(fresh.c_str());
+            std::string e = BuildWatchdogFromRepo(tag, fresh, got.empty() ? "готовая программа из репозитория здесь не запускается"
+                                                                          : "готовая программа в репозитории старая (" + got + ")");
+            if (!e.empty()) return e;
+        }
     }
     std::string backup = self + ".backup";
     if (!util::CopyFile(self, backup)) { unlink(fresh.c_str()); return "не удалось сохранить текущую версию как " + backup; }
@@ -1782,6 +1804,7 @@ void CheckForUpdateIfDue(WatchdogState& st) {
     if (st.updateLastCheckedAt != 0 && now - st.updateLastCheckedAt < UPDATE_CHECK_INTERVAL_SECONDS) return;
     st.updateLastCheckedAt = now;
     std::string tag = CheckForUpdate();
+    if (tag.empty() && g_updateCheckError.empty()) st.updateNotifiedTag.clear();   // в репозитории не новее - нечего показывать
     if (!tag.empty() && st.updateNotifiedTag != tag) {
         st.updateNotifiedTag = tag;
         std::string m = "В репозитории новая версия ygg-watchdog: " + tag + " (у тебя " + CURRENT_VERSION + "). " + REPO_PAGE +

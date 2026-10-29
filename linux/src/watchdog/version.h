@@ -1,4 +1,4 @@
 // Версия Linux-версии сторожа. Поднимать вручную при выпуске: по этой строке
 // установленные копии узнают, что в репозитории есть новая (linux/ygg-watchdog).
 #pragma once
-#define WATCHDOG_VERSION "2.0.0"
+#define WATCHDOG_VERSION "2.0.2"

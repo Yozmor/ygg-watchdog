@@ -34,8 +34,8 @@ mkdir -p ~/ygg-watchdog
 cp -r /tmp/ygg-src/linux/. ~/ygg-watchdog/
 rm -rf /tmp/ygg-src
 cd ~/ygg-watchdog
-chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск 
-./build.sh              # можно пропустить: готовая ygg-watchdog уже лежит в папке
+chmod +x build.sh install.sh tests/run_tests.sh ygg-watchdog 2>/dev/null   # разрешить запуск (из Windows-коммита оно теряется)
+./build.sh              # собрать (около минуты)
 sudo ./install.sh
 ```
 
@@ -72,9 +72,23 @@ ygg-watchdog
 
 Релизов нет: всё лежит в репозитории. Раз в сутки сторож читает `WATCHDOG_VERSION` в `linux/src/watchdog/version.h` на GitHub и, если там новее, сообщает. Установка — «Управление» → **[i]** (или `sudo ygg-watchdog apply-update`):
 
-1. скачивается `linux/ygg-watchdog` и сверяется его git-отпечаток с репозиторием;
-2. новая версия запускается с `--selftest` и должна назвать ту версию, что в исходнике (так ловится и «exe забыли закоммитить»);
-3. файл заменяется, старый остаётся как `ygg-watchdog.backup`; если на месте новая версия не прошла самопроверку — старая возвращается сама.
+1. если в репозитории лежит готовый `linux/ygg-watchdog` нужной версии — он скачивается и сверяется с git-отпечатком;
+2. если готового файла нет или он старый — сторож скачивает только папку `linux/` и собирает себя здесь же (`build.sh`, около минуты; нужны `g++`, `libssl-dev`, `git`). Вывод сборки — в `update-build.log`, свежие исходники кладутся в папку сторожа;
+3. новая версия запускается с `--selftest` и должна назвать ту версию, что в исходнике;
+4. файл заменяется, старый остаётся как `ygg-watchdog.backup`; если на месте новая версия не прошла самопроверку — старая возвращается сама.
+
+### Выпуск новой версии (для автора)
+
+1. Подними `WATCHDOG_VERSION` в `linux/src/watchdog/version.h`.
+2. Закоммить исходники — этого достаточно, собирать на Windows не нужно: сторож соберёт себя сам при обновлении.
+3. По желанию (на Linux): `./build.sh`, `./tests/run_tests.sh` и закоммитить собранный `linux/ygg-watchdog` — тогда обновление просто скачает его. Старый собранный файл в репозитории не мешает: сторож увидит, что он старше исходников, и соберёт новый.
+
+Чтобы разрешение на запуск хранилось в самом репозитории и `chmod` после клонирования был не нужен, один раз выполни в репозитории (можно и на Windows, в Git Bash):
+
+```bash
+git update-index --chmod=+x linux/build.sh linux/install.sh linux/tests/run_tests.sh linux/ygg-watchdog
+git commit -m "linux: разрешение на запуск"
+```
 
 ## Уведомления в Telegram
 

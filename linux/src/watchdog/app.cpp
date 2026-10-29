@@ -1255,9 +1255,9 @@ struct ManageScreen : Screen {
             { std::lock_guard<std::mutex> lk(mu); tag = repoTag; }
             if (tag.empty()) tag = st["update_available"].str();
             if (tag.empty() || !util::VersionNewer(CURRENT_VERSION, tag)) return true;
-            a.Confirm("Установить ygg-watchdog " + tag + "?", "Скачаю linux/ygg-watchdog из репозитория, сверю отпечаток и проверю, что новая версия запускается. "
+            a.Confirm("Установить ygg-watchdog " + tag + "?", "Есть в репозитории готовая программа - скачаю и сверю отпечаток, нет - соберу из исходников (около минуты, нужны g++, libssl-dev, git). "
                       "Старая останется рядом как .backup и вернётся сама, если новая не запустится. Окно перезапустится.", [&a] {
-                a.Run("обновление", { "apply-update" }, 300000, [&a](Job& j) {
+                a.Run("обновление", { "apply-update" }, 1500000, [&a](Job& j) {
                     if (j.res.code == 0 && util::Contains(j.res.out, "Обновлено")) {
                         a.term.Stop();
                         std::string self = util::SelfExe();
